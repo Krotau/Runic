@@ -255,7 +255,7 @@ class Wyvern:
                     name=name,
                     invoke=typed_service.emit,
                     dispatcher_emit=typed_service.emit,
-                    wrapped=service,
+                    wrapped=typed_service.emit,
                 )
             )
         return _RegisterDecorator(self, name)

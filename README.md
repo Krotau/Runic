@@ -95,7 +95,16 @@ log = await anext(log_events)
 
 Example: runtime facade
 ```python
-from wyvern import Ok, Wyvern
+from dataclasses import dataclass
+
+from wyvern import DefaultError, Ok, Wyvern
+from wyvern.result import Result
+
+
+@dataclass(slots=True)
+class GetUser:
+    user_id: int
+>>>>>>> dc897d0 (Add Wyvern runtime facade and unified registry adapter API)
 
 wyvern = Wyvern()
 
@@ -106,7 +115,7 @@ async def send_welcome(event):
 
 
 @wyvern.register("users.get")
-async def get_user(req):
+async def get_user(req: GetUser) -> Result[dict[str, int], DefaultError]:
     return Ok({"user_id": req.user_id})
 
 
@@ -118,9 +127,19 @@ async def generate_report(ctx, req):
 
 
 await wyvern.publish("user.created", {"user_id": 1})
-result = await wyvern.call("users.get", type("Req", (), {"user_id": 1})())
+result = await wyvern.call("users.get", GetUser(user_id=1))
+same_result = await get_user(GetUser(user_id=1))
+emitted = await get_user.emit(GetUser(user_id=1))
 job_id = await wyvern.dispatch("report.generate", {"user_id": 1})
 key = get_user.get_key()
+```
+
+`register(...)` is the single service registration surface. It works both as a decorator and for existing service objects, and it returns a `RegistryAdapter[...]` with `emit(...)`, async `__call__(...)`, and `get_key()`:
+
+```python
+adapter = wyvern.register("users.get", UserService())
+result = await adapter.emit(GetUser(user_id=1))
+key = adapter.get_key()
 ```
 
 Public API
@@ -129,5 +148,5 @@ Public API
 - `create_bus(shape)` creates an in-memory event bus with runtime payload checks
 - `Dispatcher` registers concrete services and retrieves typed handlers by key
 - `JobManager` runs background jobs and publishes typed status/log streams
-- `Wyvern` exposes named `publish(...)`, `call(...)`, and `dispatch(...)` helpers plus `@wyvern.on(...)`, `@wyvern.register(...)`, and `@wyvern.task(...)` decorators
+- `Wyvern` exposes named `publish(...)`, `call(...)`, and `dispatch(...)` helpers plus `@wyvern.on(...)`, `register(...)`, and `@wyvern.task(...)`
 - `Ok` and `Err` provide lightweight result containers
