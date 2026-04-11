@@ -7,6 +7,7 @@ It provides:
 - a typed in-memory event bus
 - a typed service dispatcher
 - a simple in-process job runtime
+- a small `Wyvern` runtime facade that composes those primitives
 - generic request primitives
 - generic `Ok` / `Err` result types
 
@@ -92,10 +93,41 @@ status = await anext(status_events)
 log = await anext(log_events)
 ```
 
+Example: runtime facade
+```python
+from wyvern import Ok, Wyvern
+
+wyvern = Wyvern()
+
+
+@wyvern.on("user.created")
+async def send_welcome(event):
+    print(event)
+
+
+@wyvern.register("users.get")
+async def get_user(req):
+    return Ok({"user_id": req.user_id})
+
+
+@wyvern.task("report.generate")
+async def generate_report(ctx, req):
+    await ctx.log("starting")
+    await ctx.progress(1.0)
+    return Ok({"done": True})
+
+
+await wyvern.publish("user.created", {"user_id": 1})
+result = await wyvern.call("users.get", type("Req", (), {"user_id": 1})())
+job_id = await wyvern.dispatch("report.generate", {"user_id": 1})
+key = get_user.get_key()
+```
+
 Public API
 ----------
 
 - `create_bus(shape)` creates an in-memory event bus with runtime payload checks
 - `Dispatcher` registers concrete services and retrieves typed handlers by key
 - `JobManager` runs background jobs and publishes typed status/log streams
+- `Wyvern` exposes named `publish(...)`, `call(...)`, and `dispatch(...)` helpers plus `@wyvern.on(...)`, `@wyvern.register(...)`, and `@wyvern.task(...)` decorators
 - `Ok` and `Err` provide lightweight result containers
