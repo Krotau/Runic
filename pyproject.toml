@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wyvern"
 version = "0.1.0"
-description = "Small reusable async kernel extracted from Archipelago."
+description = "Small async utility library for event-driven application code."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
