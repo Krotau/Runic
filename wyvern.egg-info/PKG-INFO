@@ -1,0 +1,76 @@
+Metadata-Version: 2.4
+Name: wyvern
+Version: 0.1.0
+Summary: Small reusable async kernel extracted from Archipelago.
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Provides-Extra: dev
+Requires-Dist: pytest>=9.0.0; extra == "dev"
+
+Wyvern
+======
+
+Wyvern is a small reusable async kernel extracted from Archipelago.
+
+It provides:
+- a typed in-memory event bus
+- a typed async dispatcher
+- a simple in-process job runtime
+- generic request primitives
+- generic `Ok` / `Err` result types
+
+It is intentionally source-only for now and does not include packaging metadata.
+
+Example: event bus
+```python
+from wyvern import Event, create_bus
+
+bus = create_bus(dict)
+subscriber = bus.subscribe()
+await bus.publish(Event(name="ready", data={"ok": True}))
+event = await anext(subscriber)
+```
+
+Example: dispatcher
+```python
+from dataclasses import dataclass
+
+from wyvern import DefaultError, Ok, Query, create_bus, create_dispatcher
+
+
+@dataclass(slots=True)
+class Ping(Query[str, DefaultError]):
+    pass
+
+
+async def handle_ping(request: Ping):
+    return Ok("pong")
+
+
+dispatcher = create_dispatcher(create_bus(dict))
+dispatcher.register(Ping, handle_ping)
+result = await dispatcher.handle(Ping())
+```
+
+Example: jobs
+```python
+from wyvern import JobManager, Ok, create_bus
+
+bus = create_bus(dict)
+jobs = JobManager(bus)
+status_events = jobs.status_events()
+log_events = jobs.log_events()
+
+
+async def work(ctx):
+    await ctx.log("starting")
+    await ctx.emit("job_output", {"line": "hello"})
+    await ctx.progress(1.0)
+    return Ok({"done": True})
+
+
+job_id = await jobs.start(work)
+record = jobs.get_status(job_id)
+status = await anext(status_events)
+log = await anext(log_events)
+```

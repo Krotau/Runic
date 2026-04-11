@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wyvern"
+version = "0.1.0"
+description = "Small reusable async kernel extracted from Archipelago."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=9.0.0"]
+
+[tool.setuptools]
+packages = ["wyvern"]
