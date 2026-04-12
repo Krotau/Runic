@@ -19,7 +19,7 @@ E = TypeVar("E")
 class Request(Generic[T, E]):
     """Base type for all dispatcher requests."""
 
-    request_id: str = field(default_factory=new_id)
+    request_id: str = field(default_factory=new_id, kw_only=True)
 
 
 class Query(Request[T, E], Generic[T, E]):

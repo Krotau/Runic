@@ -6,11 +6,12 @@ import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from functools import update_wrapper
-from typing import Any, Generic, ParamSpec, Protocol, TypeVar, cast, overload, runtime_checkable
+from typing import Any, Generic, ParamSpec, Protocol, TypeVar, cast, get_type_hints, overload, runtime_checkable
 
 from .dispatcher import AnyDispatchService, DispatchService, Dispatcher, DispatcherKey, create_dispatcher
 from .events import Event, EventBus
 from .jobs import JobContext, JobManager
+from .requests import Query
 from .result import Result
 
 
@@ -20,6 +21,7 @@ TResult = TypeVar("TResult", covariant=True)
 TError = TypeVar("TError", covariant=True)
 P = ParamSpec("P")
 logger = logging.getLogger(__name__)
+_MISSING = object()
 
 type ServiceResult[TResult, TError] = Result[TResult, TError] | Awaitable[Result[TResult, TError]]
 
@@ -129,11 +131,52 @@ class _RegisterDecorator:
         return self._runtime._register_adapter(adapter)
 
 
+class _QueryDecorator:
+    """Decorator object with overloads that preserve typed query signatures."""
+
+    def __init__(self, runtime: Wyvern, message_type: type[Any] | None) -> None:
+        self._runtime = runtime
+        self._message_type = message_type
+
+    def __call__(self, fn: Callable[[TData], ServiceResult[TResult, TError]]) -> RegistryAdapter[[TData], TResult, TError]:
+        resolved_type = self._message_type or _infer_annotated_message_type(fn)
+        if resolved_type in self._runtime._query_handlers:
+            raise DuplicateRegistrationError(f"Query already registered for type: {resolved_type.__name__}")
+        adapter = cast(
+            RegistryAdapter[[TData], TResult, TError],
+            _RegisterDecorator(self._runtime, _type_key("query", resolved_type))(fn),
+        )
+        self._runtime._query_handlers[resolved_type] = adapter
+        return adapter
+
+
 def _infer_name(name: str | None, fn: Callable[..., Any]) -> str:
     resolved = name or fn.__name__
     if not resolved:
         raise ValueError("Registration name could not be inferred")
     return resolved
+
+
+def _type_key(prefix: str, message_type: type[Any]) -> str:
+    return f"{prefix}:{message_type.__module__}.{message_type.__qualname__}"
+
+
+def _infer_annotated_message_type(fn: Callable[..., Any], *, skip: int = 0) -> type[Any]:
+    signature = inspect.signature(fn)
+    positional = [
+        parameter
+        for parameter in signature.parameters.values()
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    target = positional[skip : skip + 1]
+    if len(target) != 1:
+        raise TypeError(f"Could not infer message type for {fn.__name__}")
+    parameter = target[0]
+    hints = get_type_hints(fn)
+    annotation = hints.get(parameter.name, parameter.annotation)
+    if not isinstance(annotation, type):
+        raise TypeError(f"Missing concrete message type annotation for {fn.__name__}")
+    return annotation
 
 
 def _bind_supported_signature(fn: Callable[..., Any], *candidates: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -198,14 +241,33 @@ class Wyvern:
         self._service_keys: dict[str, DispatcherKey[AnyDispatchService]] = {}
         self._tasks: dict[str, _FunctionTaskAdapter] = {}
         self._handlers: dict[str, list[Callable[..., Any]]] = defaultdict(list)
+        self._query_handlers: dict[type[Any], RegistryAdapter[..., Any, Any]] = {}
+        self._typed_tasks: dict[type[Any], _FunctionTaskAdapter] = {}
+        self._typed_handlers: dict[type[Any], list[Callable[..., Any]]] = defaultdict(list)
         self._background_tasks: set[asyncio.Task[None]] = set()
 
-    async def publish(self, topic: str, event: Any) -> None:
-        """Broadcast an event to the bus and local topic handlers."""
+    async def publish(self, topic: str | Any, event: Any = _MISSING) -> None:
+        """Broadcast a named or typed event to the bus and local handlers."""
 
-        await self.bus.publish(Event(name=topic, data=event))
-        for handler in self._handlers.get(topic, ()):
+        if event is _MISSING:
+            payload = topic
+            topic_name = _type_key("event", type(payload))
+            await self.bus.publish(Event(name=topic_name, data=payload))
+            for handler in self._typed_handlers.get(type(payload), ()):
+                self._spawn_handler(handler, payload)
+            return
+
+        await self.bus.publish(Event(name=cast(str, topic), data=event))
+        for handler in self._handlers.get(cast(str, topic), ()):
             self._spawn_handler(handler, event)
+
+    async def ask(self, request: Query[TResult, TError]) -> Result[TResult, TError]:
+        """Invoke a typed request handler using the request object's concrete type."""
+
+        handler = self._query_handlers.get(type(request))
+        if handler is None:
+            raise ServiceNotFoundError(f"Unknown query type: {type(request).__name__}")
+        return cast(Result[TResult, TError], await handler.emit(request))
 
     async def call(self, name: str, payload: Any = None) -> Any:
         """Invoke a named service and return its reply."""
@@ -224,14 +286,44 @@ class Wyvern:
             raise TaskNotFoundError(f"Unknown task: {name}")
         return await self.jobs.start(task, data=payload)
 
-    def on(self, topic: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Register a sync or async event handler for `topic`."""
+    async def start(self, payload: Any) -> str:
+        """Start a typed task using the payload object's concrete type."""
+
+        task = self._typed_tasks.get(type(payload))
+        if task is None:
+            raise TaskNotFoundError(f"Unknown task type: {type(payload).__name__}")
+        return await self.jobs.start(task, data=payload)
+
+    def on(self, topic: str | type[Any]) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a sync or async handler for a topic name or event type."""
 
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            self._handlers[topic].append(fn)
+            if isinstance(topic, str):
+                self._handlers[topic].append(fn)
+                return fn
+            self._typed_handlers[topic].append(fn)
             return fn
 
         return decorator
+
+    @overload
+    def query(self, target: type[TData]) -> _QueryDecorator: ...
+
+    @overload
+    def query(self, target: Callable[[TData], ServiceResult[TResult, TError]]) -> RegistryAdapter[[TData], TResult, TError]: ...
+
+    @overload
+    def query(self) -> _QueryDecorator: ...
+
+    def query(
+        self,
+        target: type[Any] | Callable[..., Any] | None = None,
+    ) -> _QueryDecorator | RegistryAdapter[..., Any, Any]:
+        """Register a typed query handler resolved by request object type."""
+
+        if callable(target) and not isinstance(target, type):
+            return _QueryDecorator(self, None)(target)
+        return _QueryDecorator(self, cast(type[Any] | None, target))
 
     @overload
     def register(self, name: str | None = None) -> _RegisterDecorator: ...
@@ -260,11 +352,22 @@ class Wyvern:
             )
         return _RegisterDecorator(self, name)
 
-    def task(self, name: str | None = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Register a plain callable as a named background task."""
+    def task(self, name: str | type[Any] | None = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a named legacy task or a typed task request handler."""
+
+        if isinstance(name, type):
+            message_type = name
+
+            def typed_decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
+                if message_type in self._typed_tasks:
+                    raise DuplicateRegistrationError(f"Task already registered for type: {message_type.__name__}")
+                self._typed_tasks[message_type] = _FunctionTaskAdapter(fn)
+                return fn
+
+            return typed_decorator
 
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            resolved = _infer_name(name, fn)
+            resolved = _infer_name(cast(str | None, name), fn)
             if resolved in self._tasks:
                 raise DuplicateRegistrationError(f"Task already registered: {resolved}")
             self._tasks[resolved] = _FunctionTaskAdapter(fn)

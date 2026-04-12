@@ -73,6 +73,6 @@ class TestIntegration(unittest.IsolatedAsyncioTestCase):
     async def _wait_for_job(self, manager: JobManager, job_id: str) -> None:
         while True:
             record = manager.get_status(job_id)
-            if record and record.result == {"done": True}:
+            if isinstance(record, Ok) and record.value.result == {"done": True}:
                 return
             await asyncio.sleep(0.01)

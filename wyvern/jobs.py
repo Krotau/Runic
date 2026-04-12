@@ -9,7 +9,8 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Generic, TypeVar, ca
 from uuid import uuid4
 
 from .events import Event, EventBus
-from .result import Err, Ok
+from .requests import DefaultError
+from .result import Err, Ok, Result
 
 
 TEvent = TypeVar("TEvent")
@@ -123,10 +124,13 @@ class JobManager(Generic[TEvent]):
         self._records: dict[str, JobRecord] = {}
         self._futures: dict[str, asyncio.Future[Any]] = {}
 
-    def get_status(self, job_id: str) -> JobRecord | None:
-        """Return the current record for `job_id`, if present."""
+    def get_status(self, job_id: str) -> Result[JobRecord, DefaultError]:
+        """Return the current record for `job_id` or an explicit lookup error."""
 
-        return self._records.get(job_id)
+        record = self._records.get(job_id)
+        if record is None:
+            return Err(DefaultError(message=f"Unknown job: {job_id}", code="job_not_found"))
+        return Ok(record)
 
     def status_events(self) -> AsyncIterator[Event[JobStatusEvent]]:
         """Create an async iterator for future job status updates."""

@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from dataclasses import dataclass
 
-from wyvern import DefaultError, JobManager, JobStatus, Ok, create_bus
+from wyvern import DefaultError, Err, JobManager, JobStatus, Ok, create_bus
 
 
 @dataclass(slots=True)
@@ -46,16 +46,18 @@ class TestJobs(unittest.IsolatedAsyncioTestCase):
             await log_subscriber.aclose()
 
         record = manager.get_status(job_id)
-        assert record is not None
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        job = record.value
         self.assertEqual("job_status", status_event.name)
         self.assertEqual("running", status_event.data.status)
         self.assertEqual("job_log", log_event.name)
         self.assertEqual("started", log_event.data.message)
         self.assertIn("progress", [event.name for event in observed_events])
-        self.assertIs(JobStatus.SUCCEEDED, record.status)
-        self.assertEqual(1.0, record.progress)
-        self.assertEqual(["started", "finished"], record.logs)
-        self.assertEqual({"done": True}, record.result)
+        self.assertIs(JobStatus.SUCCEEDED, job.status)
+        self.assertEqual(1.0, job.progress)
+        self.assertEqual(["started", "finished"], job.logs)
+        self.assertEqual({"done": True}, job.result)
 
     async def test_stop_cancels_running_job(self) -> None:
         manager = JobManager(create_bus(dict))
@@ -72,8 +74,9 @@ class TestJobs(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self._wait_for_status(manager, job_id, JobStatus.CANCELLED), timeout=1.0)
 
         record = manager.get_status(job_id)
-        assert record is not None
-        self.assertIs(JobStatus.CANCELLED, record.status)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertIs(JobStatus.CANCELLED, record.value.status)
 
     async def test_error_result_uses_message_field(self) -> None:
         manager = JobManager(create_bus(dict))
@@ -85,8 +88,9 @@ class TestJobs(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self._wait_for_status(manager, job_id, JobStatus.SUCCEEDED), timeout=1.0)
 
         record = manager.get_status(job_id)
-        assert record is not None
-        self.assertEqual({"message": "custom failure"}, record.result)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertEqual({"message": "custom failure"}, record.value.result)
 
     async def test_err_result_records_failure_message(self) -> None:
         manager = JobManager(create_bus(dict))
@@ -100,9 +104,10 @@ class TestJobs(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self._wait_for_status(manager, job_id, JobStatus.FAILED), timeout=1.0)
 
         record = manager.get_status(job_id)
-        assert record is not None
-        self.assertEqual("request failed", record.error)
-        self.assertIsNone(record.result)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertEqual("request failed", record.value.error)
+        self.assertIsNone(record.value.result)
 
     async def test_progress_is_clamped(self) -> None:
         manager = JobManager(create_bus(dict))
@@ -115,9 +120,10 @@ class TestJobs(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self._wait_for_status(manager, job_id, JobStatus.SUCCEEDED), timeout=1.0)
 
         record = manager.get_status(job_id)
-        assert record is not None
-        self.assertEqual(1.0, record.progress)
-        self.assertEqual({"done": True}, record.result)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertEqual(1.0, record.value.progress)
+        self.assertEqual({"done": True}, record.value.result)
 
     async def test_start_passes_typed_context_data(self) -> None:
         manager = JobManager(create_bus(dict))
@@ -130,12 +136,23 @@ class TestJobs(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self._wait_for_status(manager, job_id, JobStatus.SUCCEEDED), timeout=1.0)
 
         record = manager.get_status(job_id)
-        assert record is not None
-        self.assertEqual({"value": 7}, record.result)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertEqual({"value": 7}, record.value.result)
+
+    def test_get_status_returns_err_for_missing_job(self) -> None:
+        manager = JobManager(create_bus(dict))
+
+        result = manager.get_status("missing")
+
+        self.assertIsInstance(result, Err)
+        assert isinstance(result, Err)
+        self.assertEqual("Unknown job: missing", result.error.message)
+        self.assertEqual("job_not_found", result.error.code)
 
     async def _wait_for_status(self, manager: JobManager, job_id: str, expected: JobStatus) -> None:
         while True:
             record = manager.get_status(job_id)
-            if record and record.status is expected:
+            if isinstance(record, Ok) and record.value.status is expected:
                 return
             await asyncio.sleep(0.01)

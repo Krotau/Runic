@@ -7,7 +7,7 @@ It provides:
 - a typed in-memory event bus
 - a typed service dispatcher
 - a simple in-process job runtime
-- a small `Wyvern` runtime facade that composes those primitives
+- a `Wyvern` runtime facade for typed queries, events, and background work
 - generic request primitives
 - generic `Ok` / `Err` result types
 
@@ -30,10 +30,12 @@ uv pip install -e .[dev]
 Run tests with:
 
 ```bash
-pytest -s
+python -m unittest discover -s tests -v
 ```
 
 Example: event bus
+------------------
+
 ```python
 from wyvern import Event, create_bus
 
@@ -44,6 +46,8 @@ event = await anext(subscriber)
 ```
 
 Example: dispatcher
+-------------------
+
 ```python
 from dataclasses import dataclass
 
@@ -66,15 +70,13 @@ same_handler = dispatcher.retrieve(key)
 result = await same_handler.emit(Ping(value="hello"))
 ```
 
-The dispatcher preserves the concrete service type across registration and
-retrieval, so editors can keep `DispatcherHandler[PingService]` on hover while
-still typing `emit(...)` from the service signature.
-
 Example: jobs
+-------------
+
 ```python
 from wyvern import JobManager, Ok, create_bus
 
-bus = create_bus(dict)
+bus = create_bus(object)
 jobs = JobManager(bus)
 status_events = jobs.status_events()
 log_events = jobs.log_events()
@@ -82,7 +84,6 @@ log_events = jobs.log_events()
 
 async def work(ctx):
     await ctx.log("starting")
-    await ctx.emit("job_output", {"line": "hello"})
     await ctx.progress(1.0)
     return Ok({"done": True})
 
@@ -93,54 +94,67 @@ status = await anext(status_events)
 log = await anext(log_events)
 ```
 
-Example: runtime facade
+`get_status(...)` returns `Ok(JobRecord(...))` for known jobs and `Err(DefaultError(...))` for unknown job ids.
+
+Example: typed runtime facade
+-----------------------------
+
 ```python
 from dataclasses import dataclass
 
-from wyvern import DefaultError, Ok, Wyvern
+from wyvern import DefaultError, Ok, Query, Wyvern
 from wyvern.result import Result
 
 
 @dataclass(slots=True)
-class GetUser:
+class GetUser(Query[dict[str, int], DefaultError]):
     user_id: int
->>>>>>> dc897d0 (Add Wyvern runtime facade and unified registry adapter API)
+
+
+@dataclass(slots=True)
+class GenerateReport:
+    user_id: int
+
+
+@dataclass(slots=True)
+class UserRequested:
+    user_id: int
+
 
 wyvern = Wyvern()
 
 
-@wyvern.on("user.created")
-async def send_welcome(event):
-    print(event)
-
-
-@wyvern.register("users.get")
+@wyvern.query(GetUser)
 async def get_user(req: GetUser) -> Result[dict[str, int], DefaultError]:
     return Ok({"user_id": req.user_id})
 
 
-@wyvern.task("report.generate")
-async def generate_report(ctx, req):
+@wyvern.on(UserRequested)
+async def on_user_requested(event: UserRequested) -> None:
+    print("user requested", event.user_id)
+
+
+@wyvern.task(GenerateReport)
+async def generate_report(ctx, req: GenerateReport) -> Ok[dict[str, bool]]:
     await ctx.log("starting")
     await ctx.progress(1.0)
     return Ok({"done": True})
 
 
-await wyvern.publish("user.created", {"user_id": 1})
-result = await wyvern.call("users.get", GetUser(user_id=1))
+await wyvern.publish(UserRequested(user_id=1))
+result = await wyvern.ask(GetUser(user_id=1))
 same_result = await get_user(GetUser(user_id=1))
 emitted = await get_user.emit(GetUser(user_id=1))
-job_id = await wyvern.dispatch("report.generate", {"user_id": 1})
+job_id = await wyvern.start(GenerateReport(user_id=1))
 key = get_user.get_key()
 ```
 
-`register(...)` is the single service registration surface. It works both as a decorator and for existing service objects, and it returns a `RegistryAdapter[...]` with `emit(...)`, async `__call__(...)`, and `get_key()`:
-
-```python
-adapter = wyvern.register("users.get", UserService())
-result = await adapter.emit(GetUser(user_id=1))
-key = adapter.get_key()
-```
+The runtime also still supports the older string-keyed APIs:
+- `register(name, ...)`
+- `call(name, payload)`
+- `task("name")`
+- `dispatch(name, payload)`
+- `publish("topic", payload)`
 
 Public API
 ----------
@@ -148,5 +162,5 @@ Public API
 - `create_bus(shape)` creates an in-memory event bus with runtime payload checks
 - `Dispatcher` registers concrete services and retrieves typed handlers by key
 - `JobManager` runs background jobs and publishes typed status/log streams
-- `Wyvern` exposes named `publish(...)`, `call(...)`, and `dispatch(...)` helpers plus `@wyvern.on(...)`, `register(...)`, and `@wyvern.task(...)`
+- `Wyvern` exposes typed `ask(...)`, `start(...)`, and `publish(...)` helpers plus `query(...)`, `task(...)`, and `on(...)`
 - `Ok` and `Err` provide lightweight result containers
