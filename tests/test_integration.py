@@ -4,8 +4,8 @@ import asyncio
 import unittest
 from dataclasses import dataclass
 
-from wyvern import DefaultError, Err, JobManager, Ok, create_bus, create_dispatcher
-from wyvern.result import Result
+from runic import DefaultError, Err, JobManager, Ok, create_bus, create_dispatcher
+from runic.result import Result
 
 
 @dataclass(slots=True)

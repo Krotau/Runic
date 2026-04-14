@@ -1,17 +1,19 @@
-Wyvern
-======
+Runic
+=====
 
-Wyvern is a small async utility library for event-driven application code.
+Runic is a small async utility library for event-driven application code.
+
+The package is published on PyPI as `runic-io` and imported in Python as `runic`.
 
 It provides:
 - a typed in-memory event bus
 - a typed service dispatcher
 - a simple in-process job runtime
-- a `Wyvern` runtime facade for typed queries, events, and background work
+- the `Runic` runtime facade for typed queries, commands, events, and background work
 - generic request primitives
 - generic `Ok` / `Err` result types
 
-Wyvern targets small, composable building blocks rather than a large framework.
+Runic targets small, composable building blocks rather than a large framework.
 
 Requirements
 ------------
@@ -27,6 +29,20 @@ source .venv/bin/activate
 uv pip install -e .[dev]
 ```
 
+Installation
+------------
+
+```bash
+uv add runic-io
+uv pip install runic-io
+pip install runic-io
+```
+
+```python
+import runic
+from runic import Runic
+```
+
 Run tests with:
 
 ```bash
@@ -37,7 +53,7 @@ Example: event bus
 ------------------
 
 ```python
-from wyvern import Event, create_bus
+from runic import Event, create_bus
 
 bus = create_bus(dict)
 subscriber = bus.subscribe()
@@ -51,7 +67,7 @@ Example: dispatcher
 ```python
 from dataclasses import dataclass
 
-from wyvern import DefaultError, Ok, Result, create_dispatcher
+from runic import DefaultError, Ok, Result, create_dispatcher
 
 
 @dataclass(slots=True)
@@ -74,7 +90,7 @@ Example: jobs
 -------------
 
 ```python
-from wyvern import JobManager, Ok, create_bus
+from runic import JobManager, Ok, create_bus
 
 bus = create_bus(object)
 jobs = JobManager(bus)
@@ -96,14 +112,28 @@ log = await anext(log_events)
 
 `get_status(...)` returns `Ok(JobRecord(...))` for known jobs and `Err(DefaultError(...))` for unknown job ids.
 
-Example: typed runtime facade
------------------------------
+You can also pass a task backend to share state across jobs:
+
+```python
+from runic import InMemoryTaskBackend, JobManager, create_bus
+
+backend = InMemoryTaskBackend()
+jobs = JobManager(create_bus(dict), backend=backend)
+
+
+async def work(ctx):
+    ctx.shared["runs"] = int(ctx.shared.get("runs", 0)) + 1
+    return {"runs": ctx.shared["runs"]}
+```
+
+Example: object handler runtime
+-------------------------------
 
 ```python
 from dataclasses import dataclass
+from decimal import Decimal
 
-from wyvern import DefaultError, Ok, Query, Wyvern
-from wyvern.result import Result
+from runic import Command, DefaultError, Ok, Query, Runic
 
 
 @dataclass(slots=True)
@@ -112,7 +142,13 @@ class GetUser(Query[dict[str, int], DefaultError]):
 
 
 @dataclass(slots=True)
-class GenerateReport:
+class RenameUser(Command[str, DefaultError]):
+    user_id: int
+    name: str
+
+
+@dataclass(slots=True)
+class GetBalance(Query[dict[str, Decimal], DefaultError]):
     user_id: int
 
 
@@ -121,40 +157,43 @@ class UserRequested:
     user_id: int
 
 
-wyvern = Wyvern()
+class UserService:
+    async def ask(self, query: GetUser) -> Ok[dict[str, int]]:
+        return Ok({"user_id": query.user_id})
+
+    async def invoke(self, command: RenameUser) -> Ok[str]:
+        return Ok(f"renamed:{command.user_id}:{command.name}")
 
 
-@wyvern.query(GetUser)
-async def get_user(req: GetUser) -> Result[dict[str, int], DefaultError]:
-    return Ok({"user_id": req.user_id})
+class BalanceService:
+    async def ask(self, query: GetBalance) -> Ok[dict[str, Decimal]]:
+        return Ok({"balance": Decimal("10.50")})
 
 
-@wyvern.on(UserRequested)
+runic = Runic()
+user_handler = runic.register(UserService())
+balance_handler = runic.register(BalanceService())
+
+
+@runic.on(UserRequested)
 async def on_user_requested(event: UserRequested) -> None:
     print("user requested", event.user_id)
 
 
-@wyvern.task(GenerateReport)
-async def generate_report(ctx, req: GenerateReport) -> Ok[dict[str, bool]]:
-    await ctx.log("starting")
-    await ctx.progress(1.0)
-    return Ok({"done": True})
-
-
-await wyvern.publish(UserRequested(user_id=1))
-result = await wyvern.ask(GetUser(user_id=1))
-same_result = await get_user(GetUser(user_id=1))
-emitted = await get_user.emit(GetUser(user_id=1))
-job_id = await wyvern.start(GenerateReport(user_id=1))
-key = get_user.get_key()
+await runic.emit(UserRequested(user_id=1))
+user_result = await user_handler.ask(GetUser(user_id=1))
+rename_result = await user_handler.invoke(RenameUser(user_id=1, name="Ada"))
+all_balances = await runic.publish(GetBalance(user_id=1))
+direct_balance = await balance_handler.ask(GetBalance(user_id=1))
 ```
 
-The runtime also still supports the older string-keyed APIs:
+The runtime also still supports the older APIs:
 - `register(name, ...)`
 - `call(name, payload)`
+- `query(...)`
 - `task("name")`
 - `dispatch(name, payload)`
-- `publish("topic", payload)`
+- `emit("topic", payload)`
 
 Public API
 ----------
@@ -162,5 +201,6 @@ Public API
 - `create_bus(shape)` creates an in-memory event bus with runtime payload checks
 - `Dispatcher` registers concrete services and retrieves typed handlers by key
 - `JobManager` runs background jobs and publishes typed status/log streams
-- `Wyvern` exposes typed `ask(...)`, `start(...)`, and `publish(...)` helpers plus `query(...)`, `task(...)`, and `on(...)`
+- `Handler[TService]` wraps object services and exposes typed `ask(...)` and `invoke(...)`
+- `Runic` exposes typed `ask(...)`, broad-query `publish(...)`, event `emit(...)`, and `start(...)` helpers plus `register(...)`, `query(...)`, `task(...)`, and `on(...)`
 - `Ok` and `Err` provide lightweight result containers

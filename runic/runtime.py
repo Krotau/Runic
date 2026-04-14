@@ -10,36 +10,44 @@ from typing import Any, Generic, ParamSpec, Protocol, TypeVar, cast, get_type_hi
 
 from .dispatcher import AnyDispatchService, DispatchService, Dispatcher, DispatcherKey, create_dispatcher
 from .events import Event, EventBus
+from .handlers import Handler, SupportsAsk, SupportsInvoke, _ServiceMethodAdapter
 from .jobs import JobContext, JobManager
-from .requests import Query
+from .requests import Command, Query
 from .result import Result
+from .backends import TaskBackend
 
 
 TEvent = TypeVar("TEvent")
 TData = TypeVar("TData")
 TResult = TypeVar("TResult", covariant=True)
 TError = TypeVar("TError", covariant=True)
+TService = TypeVar("TService")
 P = ParamSpec("P")
 logger = logging.getLogger(__name__)
-_MISSING = object()
 
 type ServiceResult[TResult, TError] = Result[TResult, TError] | Awaitable[Result[TResult, TError]]
+type QueryCallable = Callable[[Any], ServiceResult[Any, Any]]
+type CommandCallable = Callable[[Any], ServiceResult[Any, Any]]
 
 
-class WyvernError(Exception):
-    """Base error raised by the Wyvern runtime facade."""
+class RunicError(Exception):
+    """Base error raised by the Runic runtime facade."""
 
 
-class DuplicateRegistrationError(WyvernError):
+class DuplicateRegistrationError(RunicError):
     """Raised when a named service or task is registered more than once."""
 
 
-class ServiceNotFoundError(WyvernError):
+class ServiceNotFoundError(RunicError):
     """Raised when a named service cannot be resolved."""
 
 
-class TaskNotFoundError(WyvernError):
+class TaskNotFoundError(RunicError):
     """Raised when a named task cannot be resolved."""
+
+
+class AmbiguousQueryError(RunicError):
+    """Raised when more than one service can answer the same query type."""
 
 
 @runtime_checkable
@@ -99,7 +107,7 @@ class _RegistryAdapter(Generic[P, TResult, TError]):
 class _RegisterDecorator:
     """Decorator object with overloads that preserve function signatures."""
 
-    def __init__(self, runtime: Wyvern, name: str | None) -> None:
+    def __init__(self, runtime: Runic, name: str | None) -> None:
         self._runtime = runtime
         self._name = name
 
@@ -134,19 +142,20 @@ class _RegisterDecorator:
 class _QueryDecorator:
     """Decorator object with overloads that preserve typed query signatures."""
 
-    def __init__(self, runtime: Wyvern, message_type: type[Any] | None) -> None:
+    def __init__(self, runtime: Runic, message_type: type[Any] | None) -> None:
         self._runtime = runtime
         self._message_type = message_type
 
     def __call__(self, fn: Callable[[TData], ServiceResult[TResult, TError]]) -> RegistryAdapter[[TData], TResult, TError]:
         resolved_type = self._message_type or _infer_annotated_message_type(fn)
-        if resolved_type in self._runtime._query_handlers:
+        if resolved_type in self._runtime._decorated_query_types:
             raise DuplicateRegistrationError(f"Query already registered for type: {resolved_type.__name__}")
         adapter = cast(
             RegistryAdapter[[TData], TResult, TError],
             _RegisterDecorator(self._runtime, _type_key("query", resolved_type))(fn),
         )
-        self._runtime._query_handlers[resolved_type] = adapter
+        self._runtime._decorated_query_types.add(resolved_type)
+        self._runtime._query_handlers[resolved_type].append(cast(QueryCallable, adapter.emit))
         return adapter
 
 
@@ -174,7 +183,7 @@ def _infer_annotated_message_type(fn: Callable[..., Any], *, skip: int = 0) -> t
     parameter = target[0]
     hints = get_type_hints(fn)
     annotation = hints.get(parameter.name, parameter.annotation)
-    if not isinstance(annotation, type):
+    if annotation is inspect.Signature.empty or not isinstance(annotation, type):
         raise TypeError(f"Missing concrete message type annotation for {fn.__name__}")
     return annotation
 
@@ -225,7 +234,7 @@ class _DispatcherServiceBridge:
         return self._emit(data)
 
 
-class Wyvern:
+class Runic:
     """Small runtime facade that composes the bus, dispatcher, and jobs."""
 
     def __init__(
@@ -234,40 +243,62 @@ class Wyvern:
         bus: EventBus[Any] | None = None,
         dispatcher: Dispatcher | None = None,
         jobs: JobManager[Any] | None = None,
+        task_backend: TaskBackend | None = None,
     ) -> None:
+        if jobs is not None and task_backend is not None:
+            raise ValueError("Pass either jobs or task_backend, not both")
         self.bus = bus or EventBus(object)
         self.dispatcher = dispatcher or create_dispatcher()
-        self.jobs = jobs or JobManager(self.bus)
+        self.jobs = jobs or JobManager(self.bus, backend=task_backend)
         self._service_keys: dict[str, DispatcherKey[AnyDispatchService]] = {}
         self._tasks: dict[str, _FunctionTaskAdapter] = {}
-        self._handlers: dict[str, list[Callable[..., Any]]] = defaultdict(list)
-        self._query_handlers: dict[type[Any], RegistryAdapter[..., Any, Any]] = {}
+        self._event_handlers: dict[str, list[Callable[..., Any]]] = defaultdict(list)
+        self._query_handlers: dict[type[Any], list[QueryCallable]] = defaultdict(list)
+        self._decorated_query_types: set[type[Any]] = set()
+        self._command_handlers: dict[type[Any], CommandCallable] = {}
         self._typed_tasks: dict[type[Any], _FunctionTaskAdapter] = {}
-        self._typed_handlers: dict[type[Any], list[Callable[..., Any]]] = defaultdict(list)
+        self._typed_event_handlers: dict[type[Any], list[Callable[..., Any]]] = defaultdict(list)
         self._background_tasks: set[asyncio.Task[None]] = set()
 
-    async def publish(self, topic: str | Any, event: Any = _MISSING) -> None:
+    @overload
+    async def emit(self, event: Any) -> None: ...
+
+    @overload
+    async def emit(self, topic: str, event: Any) -> None: ...
+
+    async def emit(self, topic: str | Any, event: Any | None = None) -> None:
         """Broadcast a named or typed event to the bus and local handlers."""
 
-        if event is _MISSING:
-            payload = topic
-            topic_name = _type_key("event", type(payload))
-            await self.bus.publish(Event(name=topic_name, data=payload))
-            for handler in self._typed_handlers.get(type(payload), ()):
-                self._spawn_handler(handler, payload)
+        if isinstance(topic, str):
+            await self.bus.publish(Event(name=topic, data=event))
+            for handler in self._event_handlers.get(topic, ()):
+                self._spawn_handler(handler, event)
             return
 
-        await self.bus.publish(Event(name=cast(str, topic), data=event))
-        for handler in self._handlers.get(cast(str, topic), ()):
-            self._spawn_handler(handler, event)
+        payload = topic
+        topic_name = _type_key("event", type(payload))
+        await self.bus.publish(Event(name=topic_name, data=payload))
+        for handler in self._typed_event_handlers.get(type(payload), ()):
+            self._spawn_handler(handler, payload)
+
+    async def publish(self, request: Query[TResult, TError]) -> list[Result[TResult, TError]]:
+        """Fan out a typed query to every registered handler for that query type."""
+
+        handlers = self._query_handlers.get(type(request), [])
+        results: list[Result[TResult, TError]] = []
+        for handler in handlers:
+            results.append(cast(Result[TResult, TError], await _await_if_needed(handler(request))))
+        return results
 
     async def ask(self, request: Query[TResult, TError]) -> Result[TResult, TError]:
         """Invoke a typed request handler using the request object's concrete type."""
 
-        handler = self._query_handlers.get(type(request))
-        if handler is None:
+        handlers = self._query_handlers.get(type(request), [])
+        if not handlers:
             raise ServiceNotFoundError(f"Unknown query type: {type(request).__name__}")
-        return cast(Result[TResult, TError], await handler.emit(request))
+        if len(handlers) > 1:
+            raise AmbiguousQueryError(f"More than one service is registered for query type: {type(request).__name__}")
+        return cast(Result[TResult, TError], await _await_if_needed(handlers[0](request)))
 
     async def call(self, name: str, payload: Any = None) -> Any:
         """Invoke a named service and return its reply."""
@@ -299,9 +330,9 @@ class Wyvern:
 
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
             if isinstance(topic, str):
-                self._handlers[topic].append(fn)
+                self._event_handlers[topic].append(fn)
                 return fn
-            self._typed_handlers[topic].append(fn)
+            self._typed_event_handlers[topic].append(fn)
             return fn
 
         return decorator
@@ -326,6 +357,9 @@ class Wyvern:
         return _QueryDecorator(self, cast(type[Any] | None, target))
 
     @overload
+    def register(self, service: TService) -> Handler[TService]: ...
+
+    @overload
     def register(self, name: str | None = None) -> _RegisterDecorator: ...
 
     @overload
@@ -333,13 +367,16 @@ class Wyvern:
 
     def register(
         self,
-        name: str | None = None,
+        name: str | TService | None = None,
         service: AnyDispatchService | None = None,
-    ) -> _RegisterDecorator | RegistryAdapter[..., Any, Any]:
-        """Register either a decorated function service or an existing service object."""
+    ) -> _RegisterDecorator | RegistryAdapter[..., Any, Any] | Handler[Any]:
+        """Register an object service, decorated function, or legacy named service."""
+
+        if service is None and name is not None and not isinstance(name, str):
+            return self._register_handler_service(name)
 
         if service is not None:
-            if name is None:
+            if name is None or not isinstance(name, str):
                 raise ValueError("A service name is required when registering a service object")
             typed_service = cast(DispatchService[Any, Any, Any], service)
             return self._register_adapter(
@@ -350,7 +387,7 @@ class Wyvern:
                     wrapped=typed_service.emit,
                 )
             )
-        return _RegisterDecorator(self, name)
+        return _RegisterDecorator(self, cast(str | None, name))
 
     def task(self, name: str | type[Any] | None = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a named legacy task or a typed task request handler."""
@@ -383,6 +420,34 @@ class Wyvern:
         adapter._set_key(key)
         self._service_keys[adapter.name] = key
         return cast(RegistryAdapter[..., Any, Any], adapter)
+
+    def _register_handler_service(self, service: Any) -> Handler[Any]:
+        query_adapter = self._build_service_method_adapter(service, "ask")
+        command_adapter = self._build_service_method_adapter(service, "invoke")
+        if query_adapter is None and command_adapter is None:
+            raise TypeError("Registered services must define callable ask(query) and/or invoke(command) methods")
+        if query_adapter is not None:
+            self._query_handlers[query_adapter.message_type].append(cast(QueryCallable, query_adapter.call))
+        if command_adapter is not None:
+            if command_adapter.message_type in self._command_handlers:
+                raise DuplicateRegistrationError(
+                    f"Command already registered for type: {command_adapter.message_type.__name__}"
+                )
+            self._command_handlers[command_adapter.message_type] = cast(CommandCallable, command_adapter.call)
+        return Handler(service, query_adapter=query_adapter, command_adapter=command_adapter)
+
+    def _build_service_method_adapter(
+        self,
+        service: Any,
+        method_name: str,
+    ) -> _ServiceMethodAdapter[Any, Any, Any] | None:
+        method = getattr(service, method_name, None)
+        if method is None:
+            return None
+        if not callable(method):
+            raise TypeError(f"Registered services must define a callable {method_name}(...) method")
+        message_type = _infer_annotated_message_type(method)
+        return _ServiceMethodAdapter(message_type, method, _await_if_needed)
 
     def _spawn_handler(self, fn: Callable[..., Any], event: Any) -> None:
         async def run_handler() -> None:

@@ -1,17 +1,45 @@
 [build-system]
-requires = ["setuptools>=69"]
-build-backend = "setuptools.build_meta"
+requires = ["uv_build >= 0.11.6, <0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "runic"
+module-root = ""
 
 [project]
-name = "wyvern"
+name = "runic-io"
 version = "0.1.0"
 description = "Small async utility library for event-driven application code."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Tim Smeets", email = "tla.smeets@gmail.com" },
+]
+keywords = ["async", "event bus", "jobs", "runtime", "dispatcher"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "polars>=1.39.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/Krotau/Wyvern"
+Repository = "https://github.com/Krotau/Wyvern"
+Issues = "https://github.com/Krotau/Wyvern/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=9.0.0"]
+release = ["build>=1.2.2", "twine>=6.1.0"]
 
 [tool.setuptools]
-packages = ["wyvern"]
+packages = ["runic"]

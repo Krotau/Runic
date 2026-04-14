@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from dataclasses import dataclass
 
-from wyvern import DefaultError, Err, JobManager, JobStatus, Ok, create_bus
+from runic import DefaultError, Err, InMemoryTaskBackend, JobManager, JobStatus, Ok, create_bus
 
 
 @dataclass(slots=True)
@@ -96,7 +96,7 @@ class TestJobs(unittest.IsolatedAsyncioTestCase):
         manager = JobManager(create_bus(dict))
 
         async def work(ctx):
-            from wyvern import Err
+            from runic import Err
 
             return Err(DefaultError(message="request failed", code="bad_request"))
 
@@ -139,6 +139,31 @@ class TestJobs(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(record, Ok)
         assert isinstance(record, Ok)
         self.assertEqual({"value": 7}, record.value.result)
+
+    async def test_backend_shared_state_is_visible_across_jobs(self) -> None:
+        backend = InMemoryTaskBackend()
+        manager = JobManager(create_bus(dict), backend=backend)
+
+        async def work(ctx):
+            current = int(ctx.shared.get("runs", 0))
+            ctx.shared["runs"] = current + 1
+            return Ok({"runs": ctx.shared["runs"]})
+
+        first_job = await manager.start(work)
+        second_job = await manager.start(work)
+
+        await asyncio.wait_for(self._wait_for_status(manager, first_job, JobStatus.SUCCEEDED), timeout=1.0)
+        await asyncio.wait_for(self._wait_for_status(manager, second_job, JobStatus.SUCCEEDED), timeout=1.0)
+
+        first = manager.get_status(first_job)
+        second = manager.get_status(second_job)
+        self.assertIsInstance(first, Ok)
+        self.assertIsInstance(second, Ok)
+        assert isinstance(first, Ok)
+        assert isinstance(second, Ok)
+        self.assertEqual({"runs": 1}, first.value.result)
+        self.assertEqual({"runs": 2}, second.value.result)
+        self.assertEqual(2, backend.shared["runs"])
 
     def test_get_status_returns_err_for_missing_job(self) -> None:
         manager = JobManager(create_bus(dict))

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from dataclasses import dataclass
 
-from wyvern import Command, DefaultError, Query
+from runic import Command, DefaultError, Query
 
 
 @dataclass(slots=True)

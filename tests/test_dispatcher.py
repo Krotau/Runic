@@ -3,8 +3,8 @@ from __future__ import annotations
 import unittest
 from dataclasses import dataclass
 
-from wyvern import DefaultError, Err, Ok, create_dispatcher
-from wyvern.result import Result
+from runic import DefaultError, Err, Ok, create_dispatcher
+from runic.result import Result
 
 
 @dataclass(slots=True)

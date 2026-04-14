@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections.abc import MutableMapping
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
 from typing import Any, AsyncIterator, Awaitable, Callable, Generic, TypeVar, cast
@@ -11,6 +12,7 @@ from uuid import uuid4
 from .events import Event, EventBus
 from .requests import DefaultError
 from .result import Err, Ok, Result
+from .backends import InMemoryTaskBackend, TaskBackend
 
 
 TEvent = TypeVar("TEvent")
@@ -87,12 +89,14 @@ class JobContext(Generic[TEvent]):
         log_bus: EventBus[JobLog],
         record: JobRecord,
         data: TEvent | None = None,
+        shared: MutableMapping[str, Any] | None = None,
     ) -> None:
         self.job_id = job_id
         self.bus = bus
         self._log_bus = log_bus
         self.record = record
         self.data = data
+        self.shared = shared if shared is not None else {}
 
     async def emit(self, name: str, data: TEvent) -> None:
         """Publish a typed event on behalf of the running job."""
@@ -117,8 +121,9 @@ class JobContext(Generic[TEvent]):
 class JobManager(Generic[TEvent]):
     """Start, inspect, and cancel in-process background jobs."""
 
-    def __init__(self, bus: EventBus[TEvent]) -> None:
+    def __init__(self, bus: EventBus[TEvent], backend: TaskBackend | None = None) -> None:
         self._bus = bus
+        self.backend = backend or InMemoryTaskBackend()
         self._status_bus: EventBus[JobStatusEvent] = EventBus(JobStatusEvent)
         self._log_bus: EventBus[JobLog] = EventBus(JobLog)
         self._records: dict[str, JobRecord] = {}
@@ -148,7 +153,14 @@ class JobManager(Generic[TEvent]):
         job_id = str(uuid4())
         record = JobRecord(job_id=job_id)
         self._records[job_id] = record
-        ctx = JobContext(job_id=job_id, bus=self._bus, log_bus=self._log_bus, record=record, data=data)
+        ctx = JobContext(
+            job_id=job_id,
+            bus=self._bus,
+            log_bus=self._log_bus,
+            record=record,
+            data=data,
+            shared=self.backend.shared,
+        )
 
         async def publish_status() -> None:
             await self._status_bus.publish(
@@ -199,7 +211,7 @@ class JobManager(Generic[TEvent]):
                             record.progress = 1.0
                         await publish_status()
 
-        future = asyncio.create_task(run_job())
+        future = self.backend.submit(job_id, run_job)
 
         def finalize_job(done_future: asyncio.Future[Any]) -> None:
             self._futures.pop(job_id, None)

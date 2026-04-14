@@ -1,10 +1,12 @@
 # Python bytecode
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 
 # Virtual environments
 .venv/
+.venv-*/
 venv/
 env/
 ENV/
@@ -22,6 +24,7 @@ uv.lock
 .coverage
 .coverage.*
 htmlcov/
+*/**/__pycache__
 
 # Type checker / tooling caches
 .mypy_cache/
