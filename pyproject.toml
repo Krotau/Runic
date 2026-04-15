@@ -28,9 +28,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = [
-    "polars>=1.39.3",
-]
+dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/Krotau/Wyvern"
