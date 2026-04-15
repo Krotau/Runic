@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from dataclasses import dataclass
 
-from runic import DefaultError, Err, InMemoryTaskBackend, JobManager, JobStatus, Ok, create_bus
+from runic import DefaultError, Err, InMemoryTaskBackend, JobContext, JobLog, JobManager, JobRecord, JobStatus, Ok, create_bus
 
 
 @dataclass(slots=True)
@@ -165,6 +165,18 @@ class TestJobs(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({"runs": 2}, second.value.result)
         self.assertEqual(2, backend.shared["runs"])
 
+    async def test_job_context_defaults_shared_state_when_none_is_passed(self) -> None:
+        context = JobContext(
+            job_id="job-1",
+            bus=create_bus(dict),
+            log_bus=create_bus(JobLog),
+            record=JobRecord(job_id="job-1"),
+        )
+
+        self.assertEqual({}, context.shared)
+        await context.progress(-1.5)
+        self.assertEqual(0.0, context.record.progress)
+
     def test_get_status_returns_err_for_missing_job(self) -> None:
         manager = JobManager(create_bus(dict))
 
@@ -175,9 +187,76 @@ class TestJobs(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("Unknown job: missing", result.error.message)
         self.assertEqual("job_not_found", result.error.code)
 
+    async def test_plain_results_are_persisted_and_cleared_from_futures(self) -> None:
+        manager = JobManager(create_bus(dict))
+
+        def work(ctx):
+            return {"done": True}
+
+        job_id = await manager.start(work)
+        await asyncio.wait_for(self._wait_for_status(manager, job_id, JobStatus.SUCCEEDED), timeout=1.0)
+
+        record = manager.get_status(job_id)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertEqual(JobStatus.SUCCEEDED, record.value.status)
+        self.assertEqual({"done": True}, record.value.result)
+        await self._wait_for_finalization(manager, job_id)
+        self.assertNotIn(job_id, manager._futures)
+
+    async def test_err_results_without_message_attributes_use_string_fallback(self) -> None:
+        manager = JobManager(create_bus(dict))
+
+        async def work(ctx):
+            return Err(ValueError("broken"))
+
+        job_id = await manager.start(work)
+        await asyncio.wait_for(self._wait_for_status(manager, job_id, JobStatus.FAILED), timeout=1.0)
+
+        record = manager.get_status(job_id)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertEqual("broken", record.value.error)
+        self.assertIsNone(record.value.result)
+
+    async def test_failing_jobs_record_exception_message_and_clear_future(self) -> None:
+        manager = JobManager(create_bus(dict))
+
+        async def work(ctx):
+            raise RuntimeError("boom")
+
+        job_id = await manager.start(work)
+        await asyncio.wait_for(self._wait_for_status(manager, job_id, JobStatus.FAILED), timeout=1.0)
+
+        record = manager.get_status(job_id)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertEqual(JobStatus.FAILED, record.value.status)
+        self.assertEqual("boom", record.value.error)
+        await self._wait_for_finalization(manager, job_id)
+        self.assertNotIn(job_id, manager._futures)
+
+    async def test_stop_returns_false_for_missing_or_completed_jobs(self) -> None:
+        manager = JobManager(create_bus(dict))
+
+        self.assertFalse(await manager.stop("missing"))
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        future.set_result(None)
+        job_id = "done"
+        manager._records[job_id] = JobRecord(job_id=job_id)
+        manager._futures[job_id] = future
+
+        self.assertFalse(await manager.stop(job_id))
+
     async def _wait_for_status(self, manager: JobManager, job_id: str, expected: JobStatus) -> None:
         while True:
             record = manager.get_status(job_id)
             if isinstance(record, Ok) and record.value.status is expected:
                 return
+            await asyncio.sleep(0.01)
+
+    async def _wait_for_finalization(self, manager: JobManager, job_id: str) -> None:
+        while job_id in manager._futures:
             await asyncio.sleep(0.01)

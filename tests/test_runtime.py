@@ -13,12 +13,14 @@ from runic import (
     DispatchService,
     Handler,
     InMemoryTaskBackend,
+    JobManager,
     Ok,
     Query,
     RegistryAdapter,
     Runic,
     ServiceNotFoundError,
     TaskNotFoundError,
+    create_bus,
 )
 
 
@@ -72,6 +74,16 @@ class CommandOnlyService:
 
 
 class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
+    def test_runic_rejects_conflicting_job_backend_configuration(self) -> None:
+        with self.assertRaises(ValueError):
+            Runic(jobs=JobManager(create_bus(dict)), task_backend=InMemoryTaskBackend())
+
+    def test_register_rejects_non_string_service_names(self) -> None:
+        runic = Runic()
+
+        with self.assertRaises(ValueError):
+            runic.register(123, service=object())
+
     async def test_register_returns_handler_for_object_service(self) -> None:
         runic = Runic()
 
@@ -146,6 +158,15 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
         class InvalidService:
             pass
 
+        class NonCallableAskService:
+            ask = 1
+
+        class NonCallableInvokeService:
+            async def ask(self, query: GetUser) -> Ok[dict[str, str]]:
+                return Ok({"user_id": str(query.user_id)})
+
+            invoke = 1
+
         class MissingAnnotationService:
             async def ask(self, query):  # type: ignore[no-untyped-def]
                 return Ok("bad")
@@ -156,6 +177,12 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(TypeError):
             runic.register(InvalidService())
+
+        with self.assertRaises(TypeError):
+            runic.register(NonCallableAskService())
+
+        with self.assertRaises(TypeError):
+            runic.register(NonCallableInvokeService())
 
         with self.assertRaises(TypeError):
             runic.register(MissingAnnotationService())
@@ -204,6 +231,15 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(Ok("pong:hello"), direct)
         self.assertEqual(Ok("pong:hello"), result)
         self.assertIsInstance(ping.get_key(), DispatcherKey)
+
+    async def test_register_rejects_decorated_services_with_unsupported_signatures(self) -> None:
+        runic = Runic()
+
+        with self.assertRaises(TypeError):
+
+            @runic.register("bad.signature")
+            def bad(first: Ping, second: Ping) -> Ok[str]:
+                return Ok(first.value + second.value)
 
     async def test_register_decorator_registers_sync_function_with_explicit_name(self) -> None:
         runic = Runic()
@@ -264,6 +300,21 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(received.wait(), timeout=1.0)
 
         self.assertEqual([UserCreated(user_id=3)], seen)
+
+    async def test_event_handler_failures_do_not_leave_background_tasks_behind(self) -> None:
+        runic = Runic()
+        received = asyncio.Event()
+
+        @runic.on("boom")
+        async def handle(event: Ping) -> None:
+            received.set()
+            raise RuntimeError("handler failed")
+
+        await runic.emit("boom", Ping(value="event"))
+        await asyncio.wait_for(received.wait(), timeout=1.0)
+        await self._wait_for_background_tasks(runic)
+
+        self.assertEqual(set(), runic._background_tasks)
 
     async def test_task_and_dispatch_start_tracked_work(self) -> None:
         runic = Runic()
@@ -432,4 +483,8 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
             record = runic.jobs.get_status(job_id)
             if isinstance(record, Ok) and record.value.result is not None:
                 return
+            await asyncio.sleep(0.01)
+
+    async def _wait_for_background_tasks(self, runic: Runic) -> None:
+        while runic._background_tasks:
             await asyncio.sleep(0.01)
