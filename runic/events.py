@@ -27,8 +27,11 @@ class EventBus(Generic[TEvent]):
     async def publish(self, event: Event[TEvent]) -> None:
         """Publish an event to all active subscribers."""
 
+        # The bus validates payload shape at runtime because subscribers may be
+        # generic and the event payload type is not enforced by the interpreter.
         if not isinstance(event.data, self._shape):
             raise TypeError(f"Expected event payload of type {self._shape.__name__}, got {type(event.data).__name__}")
+        
         for subscriber in list(self._subscribers):
             await subscriber.put(event)
 
@@ -43,6 +46,7 @@ class EventBus(Generic[TEvent]):
                 while True:
                     yield await queue.get()
             finally:
+                # Subscriber cleanup must run even when iteration ends early.
                 with suppress(ValueError):
                     self._subscribers.remove(queue)
 

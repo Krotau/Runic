@@ -8,13 +8,21 @@ from collections.abc import Awaitable, Callable
 from functools import update_wrapper
 from typing import Any, Generic, ParamSpec, Protocol, TypeVar, cast, get_type_hints, overload, runtime_checkable
 
-from .dispatcher import AnyDispatchService, DispatchService, Dispatcher, DispatcherKey, create_dispatcher
+from .conduit import Conduit, SpellContext
+from .conjurer import AnyConjurable, Conjurable, Conjurer, ConjurerKey, create_conjurer
+from .errors import (
+    AmbiguousQueryError,
+    DefaultError,
+    DuplicateRegistrationError,
+    ServiceNotFoundError,
+    TaskNotFoundError,
+)
 from .events import Event, EventBus
 from .handlers import Handler, SupportsAsk, SupportsInvoke, _ServiceMethodAdapter
-from .jobs import JobContext, JobManager
-from .requests import Command, Query
-from .result import Result
-from .backends import TaskBackend
+from .requests import Command, Query, Request
+from .result import Err, Ok, Pending, Result
+from .spellbooks import SpellBook
+from .spells import _FunctionSpellAdapter, _SpellDecorator
 
 
 TEvent = TypeVar("TEvent")
@@ -22,32 +30,13 @@ TData = TypeVar("TData")
 TResult = TypeVar("TResult", covariant=True)
 TError = TypeVar("TError", covariant=True)
 TService = TypeVar("TService")
+TSpellData = TypeVar("TSpellData")
 P = ParamSpec("P")
 logger = logging.getLogger(__name__)
 
 type ServiceResult[TResult, TError] = Result[TResult, TError] | Awaitable[Result[TResult, TError]]
 type QueryCallable = Callable[[Any], ServiceResult[Any, Any]]
 type CommandCallable = Callable[[Any], ServiceResult[Any, Any]]
-
-
-class RunicError(Exception):
-    """Base error raised by the Runic runtime facade."""
-
-
-class DuplicateRegistrationError(RunicError):
-    """Raised when a named service or task is registered more than once."""
-
-
-class ServiceNotFoundError(RunicError):
-    """Raised when a named service cannot be resolved."""
-
-
-class TaskNotFoundError(RunicError):
-    """Raised when a named task cannot be resolved."""
-
-
-class AmbiguousQueryError(RunicError):
-    """Raised when more than one service can answer the same query type."""
 
 
 @runtime_checkable
@@ -64,8 +53,8 @@ class RegistryAdapter(Protocol[P, TResult, TError]):
         """Invoke the registered service."""
         ...
 
-    def get_key(self) -> DispatcherKey[AnyDispatchService]:
-        """Return the dispatcher key assigned at registration time."""
+    def get_key(self) -> ConjurerKey[AnyConjurable]:
+        """Return the conjurer key assigned at registration time."""
         ...
 
 
@@ -76,20 +65,20 @@ class _RegistryAdapter(Generic[P, TResult, TError]):
         self,
         name: str,
         invoke: Callable[P, ServiceResult[TResult, TError]],
-        dispatcher_emit: Callable[[Any], ServiceResult[TResult, TError]],
+        conjurer_emit: Callable[[Any], ServiceResult[TResult, TError]],
         wrapped: Callable[..., Any] | None = None,
     ) -> None:
         self.name = name
         self._invoke = invoke
-        self._dispatcher_emit = dispatcher_emit
-        self._key: DispatcherKey[AnyDispatchService] | None = None
+        self._conjurer_emit = conjurer_emit
+        self._key: ConjurerKey[AnyConjurable] | None = None
         if wrapped is not None:
             update_wrapper(self, wrapped)
 
-    def _set_key(self, key: DispatcherKey[AnyDispatchService]) -> None:
+    def _set_key(self, key: ConjurerKey[AnyConjurable]) -> None:
         self._key = key
 
-    def get_key(self) -> DispatcherKey[AnyDispatchService]:
+    def get_key(self) -> ConjurerKey[AnyConjurable]:
         if self._key is None:
             raise RuntimeError("Registry adapter has not been registered yet")
         return self._key
@@ -100,8 +89,8 @@ class _RegistryAdapter(Generic[P, TResult, TError]):
     async def __call__(self, *args: P.args, **kwargs: P.kwargs) -> Result[TResult, TError]:
         return await self.emit(*args, **kwargs)
 
-    async def emit_dispatch(self, data: Any) -> Result[TResult, TError]:
-        return await _await_if_needed(self._dispatcher_emit(data))
+    async def emit_conjured(self, data: Any) -> Result[TResult, TError]:
+        return await _await_if_needed(self._conjurer_emit(data))
 
 
 class _RegisterDecorator:
@@ -124,18 +113,19 @@ class _RegisterDecorator:
             adapter = _RegistryAdapter(
                 name=resolved,
                 invoke=fn,
-                dispatcher_emit=lambda _data: fn(),
+                conjurer_emit=lambda _data: fn(),
                 wrapped=fn,
             )
         elif parameter_count == 1:
             adapter = _RegistryAdapter(
                 name=resolved,
                 invoke=fn,
-                dispatcher_emit=fn,
+                conjurer_emit=fn,
                 wrapped=fn,
             )
         else:
             raise TypeError(f"Unsupported service signature for {fn.__name__}")
+        
         return self._runtime._register_adapter(adapter)
 
 
@@ -183,9 +173,15 @@ def _infer_annotated_message_type(fn: Callable[..., Any], *, skip: int = 0) -> t
     parameter = target[0]
     hints = get_type_hints(fn)
     annotation = hints.get(parameter.name, parameter.annotation)
-    if annotation is inspect.Signature.empty or not isinstance(annotation, type):
-        raise TypeError(f"Missing concrete message type annotation for {fn.__name__}")
-    return annotation
+    match annotation:
+        case inspect.Signature.empty:
+            raise TypeError(f"Missing concrete message type annotation for {fn.__name__}")
+        case type() as message_type:
+            if message_type.__module__ == "typing":
+                raise TypeError(f"Missing concrete message type annotation for {fn.__name__}")
+            return message_type
+        case _:
+            raise TypeError(f"Missing concrete message type annotation for {fn.__name__}")
 
 
 def _bind_supported_signature(fn: Callable[..., Any], *candidates: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -213,19 +209,8 @@ async def _await_if_needed(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
 
-class _FunctionTaskAdapter:
-    """Wrap a plain callable so it matches the job manager work shape."""
-
-    def __init__(self, fn: Callable[..., Any]) -> None:
-        self._fn = fn
-
-    async def __call__(self, ctx: JobContext[Any]) -> Any:
-        args = _bind_supported_signature(self._fn, (ctx, ctx.data), (ctx.data,), ())
-        return await _await_if_needed(self._fn(*args))
-
-
-class _DispatcherServiceBridge:
-    """Small bridge that exposes emit(data) for dispatcher registration."""
+class _ConjurerServiceBridge:
+    """Small bridge that exposes emit(data) for conjurer registration."""
 
     def __init__(self, emit: Callable[[Any], Awaitable[Any] | Any]) -> None:
         self._emit = emit
@@ -235,33 +220,58 @@ class _DispatcherServiceBridge:
 
 
 class Runic:
-    """Small runtime facade that composes the bus, dispatcher, and jobs."""
+    """Small runtime facade that composes the bus, conjurer, and conduit."""
 
     def __init__(
         self,
         *,
         bus: EventBus[Any] | None = None,
-        dispatcher: Dispatcher | None = None,
-        jobs: JobManager[Any] | None = None,
-        task_backend: TaskBackend | None = None,
+        conjurer: Conjurer | None = None,
+        conduit: Conduit[Any] | None = None,
+        spellbook: SpellBook | None = None,
     ) -> None:
-        if jobs is not None and task_backend is not None:
-            raise ValueError("Pass either jobs or task_backend, not both")
+        if conduit is not None and spellbook is not None:
+            raise ValueError("Pass either conduit or spellbook, not both")
         self.bus = bus or EventBus(object)
-        self.dispatcher = dispatcher or create_dispatcher()
-        self.jobs = jobs or JobManager(self.bus, backend=task_backend)
-        self._service_keys: dict[str, DispatcherKey[AnyDispatchService]] = {}
-        self._tasks: dict[str, _FunctionTaskAdapter] = {}
+        self.conjurer = conjurer or create_conjurer()
+        self.conduit = conduit or Conduit(self.bus, spellbook=spellbook)
+        self._service_keys: dict[str, ConjurerKey[AnyConjurable]] = {}
+        self._spells: dict[str, _FunctionSpellAdapter] = {}
         self._event_handlers: dict[str, list[Callable[..., Any]]] = defaultdict(list)
         self._query_handlers: dict[type[Any], list[QueryCallable]] = defaultdict(list)
         self._decorated_query_types: set[type[Any]] = set()
         self._command_handlers: dict[type[Any], CommandCallable] = {}
-        self._typed_tasks: dict[type[Any], _FunctionTaskAdapter] = {}
+        self._typed_spells: dict[type[Any], _FunctionSpellAdapter] = {}
         self._typed_event_handlers: dict[type[Any], list[Callable[..., Any]]] = defaultdict(list)
         self._background_tasks: set[asyncio.Task[None]] = set()
 
+    def _lookup_service_key(self, name: str) -> Result[ConjurerKey[AnyConjurable], ServiceNotFoundError]:
+        # Keep resolution explicit so missing registrations stay a normal Result
+        # branch instead of a nested if/raise path.
+        match self._service_keys.get(name):
+            case ConjurerKey() as key:
+                return Ok(key)
+            case _:
+                return Err(ServiceNotFoundError(f"Unknown service: {name}"))
+
+    def _lookup_spell(self, name: str) -> Result[_FunctionSpellAdapter, TaskNotFoundError]:
+        # The same Result shape keeps spell lookup and spell invocation aligned.
+        match self._spells.get(name):
+            case _FunctionSpellAdapter() as spell:
+                return Ok(spell)
+            case _:
+                return Err(TaskNotFoundError(f"Unknown spell: {name}"))
+
+    def _lookup_typed_spell(self, payload_type: type[Any]) -> Result[_FunctionSpellAdapter, TaskNotFoundError]:
+        # Typed spells use the concrete payload type as the lookup key.
+        match self._typed_spells.get(payload_type):
+            case _FunctionSpellAdapter() as spell:
+                return Ok(spell)
+            case _:
+                return Err(TaskNotFoundError(f"Unknown spell type: {payload_type.__name__}"))
+
     @overload
-    async def emit(self, event: Any) -> None: ...
+    async def emit(self, topic: Any) -> None: ...
 
     @overload
     async def emit(self, topic: str, event: Any) -> None: ...
@@ -269,17 +279,17 @@ class Runic:
     async def emit(self, topic: str | Any, event: Any | None = None) -> None:
         """Broadcast a named or typed event to the bus and local handlers."""
 
-        if isinstance(topic, str):
-            await self.bus.publish(Event(name=topic, data=event))
-            for handler in self._event_handlers.get(topic, ()):
-                self._spawn_handler(handler, event)
-            return
-
-        payload = topic
-        topic_name = _type_key("event", type(payload))
-        await self.bus.publish(Event(name=topic_name, data=payload))
-        for handler in self._typed_event_handlers.get(type(payload), ()):
-            self._spawn_handler(handler, payload)
+        match topic:
+            case str(topic_name):
+                await self.bus.publish(Event(name=topic_name, data=event))
+                for handler in self._event_handlers.get(topic_name, ()):
+                    self._spawn_handler(handler, event)
+            case _:
+                payload = topic
+                topic_name = _type_key("event", type(payload))
+                await self.bus.publish(Event(name=topic_name, data=payload))
+                for handler in self._typed_event_handlers.get(type(payload), ()):
+                    self._spawn_handler(handler, payload)
 
     async def publish(self, request: Query[TResult, TError]) -> list[Result[TResult, TError]]:
         """Fan out a typed query to every registered handler for that query type."""
@@ -303,36 +313,54 @@ class Runic:
     async def call(self, name: str, payload: Any = None) -> Any:
         """Invoke a named service and return its reply."""
 
-        key = self._service_keys.get(name)
-        if key is None:
-            raise ServiceNotFoundError(f"Unknown service: {name}")
-        handler = self.dispatcher.retrieve(key)
-        return await handler.emit(payload)
+        match self._lookup_service_key(name):
+            case Ok(value=key):
+                handler = self.conjurer.retrieve(key)
+                return await handler.emit(payload)
+            case Err(error=error):
+                raise error
 
-    async def dispatch(self, name: str, payload: Any = None) -> str:
-        """Start a named task as tracked background work."""
+    async def invoke(self, target: str | Any, payload: Any = None) -> str:
+        """Invoke a named or typed spell as tracked background work."""
 
-        task = self._tasks.get(name)
-        if task is None:
-            raise TaskNotFoundError(f"Unknown task: {name}")
-        return await self.jobs.start(task, data=payload)
+        match target:
+            case str(spell_name):
+                match self._lookup_spell(spell_name):
+                    case Ok(value=spell):
+                        return await self.conduit.invoke(spell, data=payload)
+                    case Err(error=error):
+                        raise error
+            case _:
+                typed_payload = target
+                match self._lookup_typed_spell(type(typed_payload)):
+                    case Ok(value=spell):
+                        return await self.conduit.invoke(spell, data=typed_payload)
+                    case Err(error=error):
+                        raise error
 
-    async def start(self, payload: Any) -> str:
-        """Start a typed task using the payload object's concrete type."""
+        raise AssertionError("Unreachable invoke branch")
 
-        task = self._typed_tasks.get(type(payload))
-        if task is None:
-            raise TaskNotFoundError(f"Unknown task type: {type(payload).__name__}")
-        return await self.jobs.start(task, data=payload)
+    @overload
+    async def cast(self, payload: Request[TResult, Any]) -> Result[TResult, DefaultError]: ...
+
+    @overload
+    async def cast(self, payload: Any) -> Result[Any, DefaultError]: ...
+
+    async def cast(self, payload: Any) -> Result[Any, DefaultError]:
+        """Invoke a typed spell and await its finished result."""
+
+        spell_id = await self.invoke(payload)
+        return await self._await_spell_result(spell_id)
 
     def on(self, topic: str | type[Any]) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a sync or async handler for a topic name or event type."""
 
         def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            if isinstance(topic, str):
-                self._event_handlers[topic].append(fn)
-                return fn
-            self._typed_event_handlers[topic].append(fn)
+            match topic:
+                case str(topic_name):
+                    self._event_handlers[topic_name].append(fn)
+                case _:
+                    self._typed_event_handlers[topic].append(fn)
             return fn
 
         return decorator
@@ -352,71 +380,77 @@ class Runic:
     ) -> _QueryDecorator | RegistryAdapter[..., Any, Any]:
         """Register a typed query handler resolved by request object type."""
 
-        if callable(target) and not isinstance(target, type):
-            return _QueryDecorator(self, None)(target)
-        return _QueryDecorator(self, cast(type[Any] | None, target))
+        match target:
+            case None:
+                return _QueryDecorator(self, None)
+            case type() as message_type:
+                return _QueryDecorator(self, message_type)
+            case _ if callable(target):
+                return _QueryDecorator(self, None)(target)
+            case _:
+                return _QueryDecorator(self, cast(type[Any] | None, target))
 
     @overload
-    def register(self, service: TService) -> Handler[TService]: ...
+    def conjure(self, name: TService) -> Handler[TService]: ...
 
     @overload
-    def register(self, name: str | None = None) -> _RegisterDecorator: ...
+    def conjure(self, name: str | None = None) -> _RegisterDecorator: ...
 
     @overload
-    def register(self, name: str, service: DispatchService[TData, TResult, TError]) -> RegistryAdapter[[TData], TResult, TError]: ...
+    def conjure(self, name: str, service: Conjurable[TData, TResult, TError]) -> RegistryAdapter[[TData], TResult, TError]: ...
 
-    def register(
+    def conjure(
         self,
-        name: str | TService | None = None,
-        service: AnyDispatchService | None = None,
+        name: str | object | None = None,
+        service: AnyConjurable | None = None,
     ) -> _RegisterDecorator | RegistryAdapter[..., Any, Any] | Handler[Any]:
-        """Register an object service, decorated function, or legacy named service."""
+        """Conjure an object service, decorated function, or named service."""
 
-        if service is None and name is not None and not isinstance(name, str):
-            return self._register_handler_service(name)
+        match service:
+            case None:
+                match name:
+                    case None | str():
+                        return _RegisterDecorator(self, cast(str | None, name))
+                    case _:
+                        return self._register_handler_service(name)
+            case _:
+                match name:
+                    case str(service_name):
+                        typed_service = cast(Conjurable[Any, Any, Any], service)
+                        return self._register_adapter(
+                            _RegistryAdapter(
+                                name=service_name,
+                                invoke=typed_service.emit,
+                                conjurer_emit=typed_service.emit,
+                                wrapped=typed_service.emit,
+                            )
+                        )
+                    case _:
+                        raise ValueError("A service name is required when conjuring a service object")
 
-        if service is not None:
-            if name is None or not isinstance(name, str):
-                raise ValueError("A service name is required when registering a service object")
-            typed_service = cast(DispatchService[Any, Any, Any], service)
-            return self._register_adapter(
-                _RegistryAdapter(
-                    name=name,
-                    invoke=typed_service.emit,
-                    dispatcher_emit=typed_service.emit,
-                    wrapped=typed_service.emit,
-                )
-            )
-        return _RegisterDecorator(self, cast(str | None, name))
+    @overload
+    def spell(self, name: None = None) -> _SpellDecorator[Any]: ...
 
-    def task(self, name: str | type[Any] | None = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Register a named legacy task or a typed task request handler."""
+    @overload
+    def spell(self, name: str) -> _SpellDecorator[Any]: ...
 
-        if isinstance(name, type):
-            message_type = name
+    @overload
+    def spell(self, name: type[TSpellData]) -> _SpellDecorator[TSpellData]: ...
 
-            def typed_decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-                if message_type in self._typed_tasks:
-                    raise DuplicateRegistrationError(f"Task already registered for type: {message_type.__name__}")
-                self._typed_tasks[message_type] = _FunctionTaskAdapter(fn)
-                return fn
+    def spell(self, name: str | type[TSpellData] | None = None) -> _SpellDecorator[Any] | _SpellDecorator[TSpellData]:
+        """Register a named legacy spell or a typed spell request handler."""
 
-            return typed_decorator
-
-        def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
-            resolved = _infer_name(cast(str | None, name), fn)
-            if resolved in self._tasks:
-                raise DuplicateRegistrationError(f"Task already registered: {resolved}")
-            self._tasks[resolved] = _FunctionTaskAdapter(fn)
-            return fn
-
-        return decorator
+        match name:
+            case type() as message_type:
+                return _SpellDecorator(self, None, message_type)
+            case _:
+                return _SpellDecorator(self, cast(str | None, name), None)
 
     def _register_adapter(self, adapter: _RegistryAdapter[Any, Any, Any]) -> RegistryAdapter[..., Any, Any]:
         if adapter.name in self._service_keys:
             raise DuplicateRegistrationError(f"Service already registered: {adapter.name}")
-        service = cast(AnyDispatchService, _DispatcherServiceBridge(adapter.emit_dispatch))
-        _, key = self.dispatcher.register(service)
+        service = cast(AnyConjurable, _ConjurerServiceBridge(adapter.emit_conjured))
+        _, key = self.conjurer.conjure(service)
         adapter._set_key(key)
         self._service_keys[adapter.name] = key
         return cast(RegistryAdapter[..., Any, Any], adapter)
@@ -447,7 +481,8 @@ class Runic:
         if not callable(method):
             raise TypeError(f"Registered services must define a callable {method_name}(...) method")
         message_type = _infer_annotated_message_type(method)
-        return _ServiceMethodAdapter(message_type, method, _await_if_needed)
+        typed_method = cast(Callable[[Any], ServiceResult[Any, Any]], method)
+        return _ServiceMethodAdapter(message_type, typed_method, _await_if_needed)
 
     def _spawn_handler(self, fn: Callable[..., Any], event: Any) -> None:
         async def run_handler() -> None:
@@ -466,3 +501,41 @@ class Runic:
                 logger.exception("Event handler failed.", exc_info=error)
 
         task.add_done_callback(finalize)
+
+    async def _await_spell_result(self, spell_id: str) -> Result[Any, DefaultError]:
+        # Poll the conduit until the spell has moved out of its running states,
+        # then return the normalized result view for the finished record.
+        while True:
+            match self.conduit.get_spell_result(spell_id):
+                case Pending():
+                    await asyncio.sleep(0.01)
+                case result:
+                    return result
+
+    def register(
+        self,
+        name: str | object | None = None,
+        service: AnyConjurable | None = None,
+    ) -> _RegisterDecorator | RegistryAdapter[..., Any, Any] | Handler[Any]:
+        """Backward-compatible alias for `conjure(...)`."""
+
+        conjure = cast(
+            Callable[[str | object | None, AnyConjurable | None], _RegisterDecorator | RegistryAdapter[..., Any, Any] | Handler[Any]],
+            self.conjure,
+        )
+        return conjure(name, service)
+
+    def task(self, name: str | type[Any] | None = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Backward-compatible alias for `spell(...)`."""
+
+        return self.spell(name)
+
+    async def dispatch(self, name: str, payload: Any = None) -> str:
+        """Backward-compatible alias for named `invoke(...)` calls."""
+
+        return await self.invoke(name, payload)
+
+    async def start(self, payload: Any) -> str:
+        """Backward-compatible alias for typed `invoke(...)` calls."""
+
+        return await self.invoke(payload)

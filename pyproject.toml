@@ -17,7 +17,7 @@ license-files = ["LICENSE"]
 authors = [
     { name = "Tim Smeets", email = "tla.smeets@gmail.com" },
 ]
-keywords = ["async", "event bus", "jobs", "runtime", "dispatcher"]
+keywords = ["async", "event bus", "spells", "runtime", "conjurer"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

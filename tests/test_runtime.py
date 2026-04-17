@@ -8,12 +8,12 @@ from decimal import Decimal
 from runic import (
     AmbiguousQueryError,
     Command,
+    Conjurable,
+    Conduit,
+    ConjurerKey,
     DuplicateRegistrationError,
-    DispatcherKey,
-    DispatchService,
     Handler,
-    InMemoryTaskBackend,
-    JobManager,
+    InMemorySpellBook,
     Ok,
     Query,
     RegistryAdapter,
@@ -74,20 +74,20 @@ class CommandOnlyService:
 
 
 class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
-    def test_runic_rejects_conflicting_job_backend_configuration(self) -> None:
+    def test_runic_rejects_conflicting_conduit_spellbook_configuration(self) -> None:
         with self.assertRaises(ValueError):
-            Runic(jobs=JobManager(create_bus(dict)), task_backend=InMemoryTaskBackend())
+            Runic(conduit=Conduit(create_bus(dict)), spellbook=InMemorySpellBook())
 
-    def test_register_rejects_non_string_service_names(self) -> None:
+    def test_conjure_rejects_non_string_service_names(self) -> None:
         runic = Runic()
 
         with self.assertRaises(ValueError):
-            runic.register(123, service=object())
+            runic.conjure(123, service=object())
 
-    async def test_register_returns_handler_for_object_service(self) -> None:
+    async def test_conjure_returns_handler_for_object_service(self) -> None:
         runic = Runic()
 
-        handler = runic.register(AccountService())
+        handler = runic.conjure(AccountService())
 
         self.assertIsInstance(handler, Handler)
         result = await handler.ask(GetBalance(user_id=1))
@@ -100,8 +100,8 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
     async def test_handler_supports_query_only_and_command_only_services(self) -> None:
         runic = Runic()
 
-        query_handler = runic.register(QueryOnlyService())
-        command_handler = runic.register(CommandOnlyService())
+        query_handler = runic.conjure(QueryOnlyService())
+        command_handler = runic.conjure(CommandOnlyService())
 
         self.assertEqual(Ok({"user_id": "7"}), await query_handler.ask(GetUser(user_id=7)))
         self.assertEqual(Ok("cmd:Ada"), await command_handler.invoke(RenameUser(user_id=1, name="Ada")))
@@ -114,13 +114,13 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
 
     async def test_publish_fans_out_query_to_all_matching_services(self) -> None:
         runic = Runic()
-        first = runic.register(QueryOnlyService())
+        first = runic.conjure(QueryOnlyService())
 
         class SecondQueryService:
             async def ask(self, query: GetUser) -> Ok[dict[str, str]]:
                 return Ok({"user_id": f"secondary:{query.user_id}"})
 
-        second = runic.register(SecondQueryService())
+        second = runic.conjure(SecondQueryService())
 
         results = await runic.publish(GetUser(user_id=4))
 
@@ -141,18 +141,18 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ServiceNotFoundError):
             await runic.ask(GetUser(user_id=1))
 
-        runic.register(QueryOnlyService())
+        runic.conjure(QueryOnlyService())
 
         class DuplicateQueryService:
             async def ask(self, query: GetUser) -> Ok[dict[str, str]]:
                 return Ok({"user_id": f"duplicate:{query.user_id}"})
 
-        runic.register(DuplicateQueryService())
+        runic.conjure(DuplicateQueryService())
 
         with self.assertRaises(AmbiguousQueryError):
             await runic.ask(GetUser(user_id=2))
 
-    async def test_register_rejects_invalid_or_duplicate_object_services(self) -> None:
+    async def test_conjure_rejects_invalid_or_duplicate_object_services(self) -> None:
         runic = Runic()
 
         class InvalidService:
@@ -176,21 +176,21 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
                 return Ok(command.name)
 
         with self.assertRaises(TypeError):
-            runic.register(InvalidService())
+            runic.conjure(InvalidService())
 
         with self.assertRaises(TypeError):
-            runic.register(NonCallableAskService())
+            runic.conjure(NonCallableAskService())
 
         with self.assertRaises(TypeError):
-            runic.register(NonCallableInvokeService())
+            runic.conjure(NonCallableInvokeService())
 
         with self.assertRaises(TypeError):
-            runic.register(MissingAnnotationService())
+            runic.conjure(MissingAnnotationService())
 
-        runic.register(RenameService())
+        runic.conjure(RenameService())
 
         with self.assertRaises(DuplicateRegistrationError):
-            runic.register(RenameService())
+            runic.conjure(RenameService())
 
     async def test_query_and_ask_use_request_type_lookup(self) -> None:
         runic = Runic()
@@ -204,7 +204,7 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(Ok({"user_id": "7"}), result)
         self.assertEqual(Ok({"user_id": "7"}), direct)
-        self.assertIsInstance(get_user.get_key(), DispatcherKey)
+        self.assertIsInstance(get_user.get_key(), ConjurerKey)
 
     async def test_query_supports_inferred_request_type(self) -> None:
         runic = Runic()
@@ -217,10 +217,10 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(Ok({"user_id": "11"}), result)
 
-    async def test_service_decorator_registers_async_function_with_inferred_name(self) -> None:
+    async def test_conjure_decorator_registers_async_function_with_inferred_name(self) -> None:
         runic = Runic()
 
-        @runic.register()
+        @runic.conjure()
         async def ping(req: Ping) -> Ok[str]:
             return Ok(f"pong:{req.value}")
 
@@ -230,21 +230,21 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(Ok("pong:hello"), direct)
         self.assertEqual(Ok("pong:hello"), result)
-        self.assertIsInstance(ping.get_key(), DispatcherKey)
+        self.assertIsInstance(ping.get_key(), ConjurerKey)
 
-    async def test_register_rejects_decorated_services_with_unsupported_signatures(self) -> None:
+    async def test_conjure_rejects_decorated_services_with_unsupported_signatures(self) -> None:
         runic = Runic()
 
         with self.assertRaises(TypeError):
 
-            @runic.register("bad.signature")
+            @runic.conjure("bad.signature")
             def bad(first: Ping, second: Ping) -> Ok[str]:
                 return Ok(first.value + second.value)
 
-    async def test_register_decorator_registers_sync_function_with_explicit_name(self) -> None:
+    async def test_conjure_decorator_registers_sync_function_with_explicit_name(self) -> None:
         runic = Runic()
 
-        @runic.register("users.get")
+        @runic.conjure("users.get")
         def get_user(req: Ping) -> Ok[dict[str, str]]:
             return Ok({"value": req.value.upper()})
 
@@ -259,17 +259,17 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
     async def test_call_invokes_existing_object_service(self) -> None:
         runic = Runic()
 
-        class PingService(DispatchService[Ping, str, object]):
+        class PingService(Conjurable[Ping, str, object]):
             async def emit(self, data: Ping) -> Ok[str]:
                 return Ok(f"service:{data.value}")
 
-        adapter = runic.register("ping.object", PingService())
+        adapter = runic.conjure("ping.object", PingService())
         result = await runic.call("ping.object", Ping(value="ok"))
         direct = await adapter.emit(Ping(value="ok"))
 
         self.assertEqual(Ok("service:ok"), result)
         self.assertEqual(Ok("service:ok"), direct)
-        self.assertIsInstance(adapter.get_key(), DispatcherKey)
+        self.assertIsInstance(adapter.get_key(), ConjurerKey)
 
     async def test_on_and_emit_route_topic_handlers(self) -> None:
         runic = Runic()
@@ -316,116 +316,18 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(set(), runic._background_tasks)
 
-    async def test_task_and_dispatch_start_tracked_work(self) -> None:
-        runic = Runic()
-
-        @runic.task("report.generate")
-        async def generate_report(ctx, req: Ping) -> Ok[dict[str, bool]]:
-            await ctx.log(f"starting:{req.value}")
-            await ctx.progress(1.0)
-            return Ok({"done": True})
-
-        job_id = await runic.dispatch("report.generate", Ping(value="job"))
-        await asyncio.wait_for(self._wait_for_result(runic, job_id), timeout=1.0)
-
-        record = runic.jobs.get_status(job_id)
-        self.assertIsInstance(record, Ok)
-        assert isinstance(record, Ok)
-        self.assertEqual(["starting:job"], record.value.logs)
-        self.assertEqual({"done": True}, record.value.result)
-
-    async def test_task_supports_payload_only_and_no_args_signatures(self) -> None:
-        runic = Runic()
-
-        @runic.task("payload.only")
-        def payload_only(req: Ping) -> Ok[str]:
-            return Ok(req.value)
-
-        @runic.task()
-        def no_args() -> Ok[str]:
-            return Ok("done")
-
-        first_job = await runic.dispatch("payload.only", Ping(value="value"))
-        second_job = await runic.dispatch("no_args")
-
-        await asyncio.wait_for(self._wait_for_result(runic, first_job), timeout=1.0)
-        await asyncio.wait_for(self._wait_for_result(runic, second_job), timeout=1.0)
-
-        first = runic.jobs.get_status(first_job)
-        second = runic.jobs.get_status(second_job)
-        self.assertIsInstance(first, Ok)
-        self.assertIsInstance(second, Ok)
-        assert isinstance(first, Ok)
-        assert isinstance(second, Ok)
-        self.assertEqual("value", first.value.result)
-        self.assertEqual("done", second.value.result)
-
-    async def test_typed_task_and_start_use_payload_type_lookup(self) -> None:
-        runic = Runic()
-
-        @runic.task(GenerateReport)
-        async def generate_report(ctx, req: GenerateReport) -> Ok[dict[str, str]]:
-            await ctx.log(f"starting:{req.report_id}")
-            await ctx.progress(1.0)
-            return Ok({"report_id": req.report_id})
-
-        job_id = await runic.start(GenerateReport(report_id="r1"))
-        await asyncio.wait_for(self._wait_for_result(runic, job_id), timeout=1.0)
-
-        record = runic.jobs.get_status(job_id)
-        self.assertIsInstance(record, Ok)
-        assert isinstance(record, Ok)
-        self.assertEqual(["starting:r1"], record.value.logs)
-        self.assertEqual({"report_id": "r1"}, record.value.result)
-
-    async def test_runic_threads_custom_task_backend_into_task_context(self) -> None:
-        backend = InMemoryTaskBackend()
-        runic = Runic(task_backend=backend)
-
-        @runic.task(GenerateReport)
-        async def generate_report(ctx, req: GenerateReport) -> Ok[dict[str, int]]:
-            runs = int(ctx.shared.get("runs", 0)) + 1
-            ctx.shared["runs"] = runs
-            return Ok({"runs": runs})
-
-        first_job = await runic.start(GenerateReport(report_id="one"))
-        second_job = await runic.start(GenerateReport(report_id="two"))
-
-        await asyncio.wait_for(self._wait_for_result(runic, first_job), timeout=1.0)
-        await asyncio.wait_for(self._wait_for_result(runic, second_job), timeout=1.0)
-
-        first = runic.jobs.get_status(first_job)
-        second = runic.jobs.get_status(second_job)
-        self.assertIsInstance(first, Ok)
-        self.assertIsInstance(second, Ok)
-        assert isinstance(first, Ok)
-        assert isinstance(second, Ok)
-        self.assertEqual({"runs": 1}, first.value.result)
-        self.assertEqual({"runs": 2}, second.value.result)
-        self.assertEqual(2, backend.shared["runs"])
-
     async def test_duplicate_registration_errors(self) -> None:
         runic = Runic()
 
-        @runic.register("duplicate")
+        @runic.conjure("duplicate")
         async def first(req: Ping) -> Ok[str]:
             return Ok(req.value)
 
         with self.assertRaises(DuplicateRegistrationError):
 
-            @runic.register("duplicate")
+            @runic.conjure("duplicate")
             async def second(req: Ping) -> Ok[str]:
                 return Ok(req.value)
-
-        @runic.task("duplicate.task")
-        async def task_one() -> Ok[str]:
-            return Ok("one")
-
-        with self.assertRaises(DuplicateRegistrationError):
-
-            @runic.task("duplicate.task")
-            async def task_two() -> Ok[str]:
-                return Ok("two")
 
         @runic.query(GetUser)
         async def get_user(req: GetUser) -> Ok[str]:
@@ -437,53 +339,31 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
             async def second_query(req: GetUser) -> Ok[str]:
                 return Ok(str(req.user_id))
 
-        @runic.task(GenerateReport)
-        async def typed_task(ctx, req: GenerateReport) -> Ok[str]:
-            return Ok(req.report_id)
-
-        with self.assertRaises(DuplicateRegistrationError):
-
-            @runic.task(GenerateReport)
-            async def second_typed_task(ctx, req: GenerateReport) -> Ok[str]:
-                return Ok(req.report_id)
-
         self.assertEqual("first", first.__name__)
-        self.assertEqual("task_one", task_one.__name__)
         self.assertEqual("get_user", get_user.__name__)
-        self.assertEqual("typed_task", typed_task.__name__)
 
-    async def test_missing_service_and_task_errors(self) -> None:
+    async def test_missing_service_and_spell_errors(self) -> None:
         runic = Runic()
 
         with self.assertRaises(ServiceNotFoundError):
             await runic.call("missing")
 
         with self.assertRaises(TaskNotFoundError):
-            await runic.dispatch("missing")
+            await runic.invoke("missing")
 
         with self.assertRaises(ServiceNotFoundError):
             await runic.ask(GetUser(user_id=1))
 
-        with self.assertRaises(TaskNotFoundError):
-            await runic.start(GenerateReport(report_id="missing"))
-
-    async def test_register_supports_no_arg_services(self) -> None:
+    async def test_conjure_supports_no_arg_services(self) -> None:
         runic = Runic()
 
-        @runic.register()
+        @runic.conjure()
         def ping() -> Ok[str]:
             return Ok("pong")
 
         self.assertEqual(Ok("pong"), await ping())
         self.assertEqual(Ok("pong"), await ping.emit())
-        self.assertIsInstance(ping.get_key(), DispatcherKey)
-
-    async def _wait_for_result(self, runic: Runic, job_id: str) -> None:
-        while True:
-            record = runic.jobs.get_status(job_id)
-            if isinstance(record, Ok) and record.value.result is not None:
-                return
-            await asyncio.sleep(0.01)
+        self.assertIsInstance(ping.get_key(), ConjurerKey)
 
     async def _wait_for_background_tasks(self, runic: Runic) -> None:
         while runic._background_tasks:

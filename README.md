@@ -7,8 +7,8 @@ The package is published on PyPI as `runic-io` and imported in Python as `runic`
 
 It provides:
 - a typed in-memory event bus
-- a typed service dispatcher
-- a simple in-process job runtime
+- a typed service conjurer
+- a simple in-process conduit for background spells
 - the `Runic` runtime facade for typed queries, commands, events, and background work
 - generic request primitives
 - generic `Ok` / `Err` result types
@@ -61,13 +61,13 @@ await bus.publish(Event(name="ready", data={"ok": True}))
 event = await anext(subscriber)
 ```
 
-Example: dispatcher
--------------------
+Example: conjurer
+-----------------
 
 ```python
 from dataclasses import dataclass
 
-from runic import DefaultError, Ok, Result, create_dispatcher
+from runic import DefaultError, Ok, Result, create_conjurer
 
 
 @dataclass(slots=True)
@@ -80,22 +80,22 @@ class PingService:
         return Ok(f"pong:{data.value}")
 
 
-dispatcher = create_dispatcher()
-handler, key = dispatcher.register(PingService())
-same_handler = dispatcher.retrieve(key)
+conjurer = create_conjurer()
+handler, key = conjurer.conjure(PingService())
+same_handler = conjurer.retrieve(key)
 result = await same_handler.emit(Ping(value="hello"))
 ```
 
-Example: jobs
--------------
+Example: conduit
+----------------
 
 ```python
-from runic import JobManager, Ok, create_bus
+from runic import Conduit, Ok, create_bus
 
 bus = create_bus(object)
-jobs = JobManager(bus)
-status_events = jobs.status_events()
-log_events = jobs.log_events()
+conduit = Conduit(bus)
+status_events = conduit.status_events()
+log_events = conduit.log_events()
 
 
 async def work(ctx):
@@ -104,21 +104,21 @@ async def work(ctx):
     return Ok({"done": True})
 
 
-job_id = await jobs.start(work)
-record = jobs.get_status(job_id)
+spell_id = await conduit.invoke(work)
+record = conduit.get_status(spell_id)
 status = await anext(status_events)
 log = await anext(log_events)
 ```
 
-`get_status(...)` returns `Ok(JobRecord(...))` for known jobs and `Err(DefaultError(...))` for unknown job ids.
+`get_status(...)` returns `Ok(SpellRecord(...))` for known spells and `Err(DefaultError(...))` for unknown spell ids.
 
-You can also pass a task backend to share state across jobs:
+You can also pass a spellbook to share state across spells:
 
 ```python
-from runic import InMemoryTaskBackend, JobManager, create_bus
+from runic import Conduit, InMemorySpellBook, create_bus
 
-backend = InMemoryTaskBackend()
-jobs = JobManager(create_bus(dict), backend=backend)
+spellbook = InMemorySpellBook()
+conduit = Conduit(create_bus(dict), spellbook=spellbook)
 
 
 async def work(ctx):
@@ -171,8 +171,8 @@ class BalanceService:
 
 
 runic = Runic()
-user_handler = runic.register(UserService())
-balance_handler = runic.register(BalanceService())
+user_handler = runic.conjure(UserService())
+balance_handler = runic.conjure(BalanceService())
 
 
 @runic.on(UserRequested)
@@ -188,19 +188,19 @@ direct_balance = await balance_handler.ask(GetBalance(user_id=1))
 ```
 
 The runtime also still supports the older APIs:
-- `register(name, ...)`
+- `conjure(name, ...)`
 - `call(name, payload)`
 - `query(...)`
-- `task("name")`
-- `dispatch(name, payload)`
+- `spell("name")`
+- `invoke("name", payload)`
 - `emit("topic", payload)`
 
 Public API
 ----------
 
 - `create_bus(shape)` creates an in-memory event bus with runtime payload checks
-- `Dispatcher` registers concrete services and retrieves typed handlers by key
-- `JobManager` runs background jobs and publishes typed status/log streams
+- `Conjurer` registers concrete services and retrieves typed handlers by key
+- `Conduit` runs background spells and publishes typed status/log streams
 - `Handler[TService]` wraps object services and exposes typed `ask(...)` and `invoke(...)`
-- `Runic` exposes typed `ask(...)`, broad-query `publish(...)`, event `emit(...)`, and `start(...)` helpers plus `register(...)`, `query(...)`, `task(...)`, and `on(...)`
+- `Runic` exposes typed `ask(...)`, broad-query `publish(...)`, event `emit(...)`, and `invoke(...)` helpers plus `conjure(...)`, `query(...)`, `spell(...)`, and `on(...)`
 - `Ok` and `Err` provide lightweight result containers

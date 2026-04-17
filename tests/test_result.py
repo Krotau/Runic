@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from dataclasses import dataclass
 
-from runic import Err, Ok, Result
+from runic import Err, Ok, Pending, Result, ResultStatus
 
 
 @dataclass(slots=True)
@@ -26,6 +26,14 @@ class TestResultComparisons(unittest.TestCase):
         self.assertEqual(result, "boom")
         self.assertLess(result, "z")
         self.assertTrue(result.compare("boom"))
+
+    def test_pending_exposes_pending_status_and_falsey_truthiness(self) -> None:
+        result: Result[int, str] = Pending()
+
+        self.assertIs(ResultStatus.PENDING, result.status)
+        self.assertFalse(result)
+        self.assertEqual(Pending(), result)
+        self.assertNotEqual(result, None)
 
     def test_shallow_equality_compares_inner_value(self) -> None:
         self.assertEqual(Ok(3), 3)

@@ -5,8 +5,8 @@ import inspect
 import unittest
 from dataclasses import dataclass
 
-from runic import DefaultError, Err, Ok, create_dispatcher
-from runic.dispatcher import Dispatcher, DispatcherKey
+from runic import ConjurerKey, DefaultError, Err, Ok, create_conjurer
+from runic.conjurer import Conjurer
 from runic.result import Result
 
 
@@ -35,8 +35,8 @@ def is_self_mutation_target(node: ast.expr) -> bool:
             return False
 
 
-def mutation_lines_for_dispatcher() -> set[int]:
-    source_lines, start_line = inspect.getsourcelines(Dispatcher)
+def mutation_lines_for_conjurer() -> set[int]:
+    source_lines, start_line = inspect.getsourcelines(Conjurer)
     class_node = ast.parse("".join(source_lines)).body[0]
     assert isinstance(class_node, ast.ClassDef)
 
@@ -69,18 +69,18 @@ def mutation_lines_for_dispatcher() -> set[int]:
     return mutation_lines
 
 
-class TestDispatcher(unittest.IsolatedAsyncioTestCase):
-    def test_dispatcher_ast_exposes_expected_mutation_lines(self) -> None:
-        self.assertEqual({70, 80, 95}, mutation_lines_for_dispatcher())
+class TestConjurer(unittest.IsolatedAsyncioTestCase):
+    def test_conjurer_ast_exposes_expected_mutation_lines(self) -> None:
+        self.assertEqual({70, 80, 97}, mutation_lines_for_conjurer())
 
-    def test_dispatcher_starts_with_empty_service_registry(self) -> None:
-        dispatcher = create_dispatcher()
+    def test_conjurer_starts_with_empty_service_registry(self) -> None:
+        conjurer = create_conjurer()
 
-        self.assertEqual({}, dispatcher._services)
+        self.assertEqual({}, conjurer._services)
 
-    async def test_register_returns_handler_and_key(self) -> None:
-        dispatcher = create_dispatcher()
-        handler, key = dispatcher.register(ExampleService())
+    async def test_conjure_returns_handler_and_key(self) -> None:
+        conjurer = create_conjurer()
+        handler, key = conjurer.conjure(ExampleService())
 
         result = await handler.emit(ExampleData(value="registered"))
         self.assertIsInstance(result, Ok)
@@ -88,19 +88,19 @@ class TestDispatcher(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("REGISTERED", result.value)
         self.assertTrue(key.value)
 
-    async def test_register_stores_service_under_generated_key(self) -> None:
-        dispatcher = create_dispatcher()
+    async def test_conjure_stores_service_under_generated_key(self) -> None:
+        conjurer = create_conjurer()
         service = ExampleService()
 
-        handler, key = dispatcher.register(service)
+        handler, key = conjurer.conjure(service)
 
-        self.assertIs(dispatcher._services[key], service)
+        self.assertIs(conjurer._services[key], service)
         self.assertIs(handler.service, service)
 
     async def test_retrieve_returns_equivalent_handler(self) -> None:
-        dispatcher = create_dispatcher()
-        handler, key = dispatcher.register(ExampleService())
-        retrieved = dispatcher.retrieve(key)
+        conjurer = create_conjurer()
+        handler, key = conjurer.conjure(ExampleService())
+        retrieved = conjurer.retrieve(key)
 
         first = await handler.emit(ExampleData(value="same"))
         second = await retrieved.emit(ExampleData(value="same"))
@@ -108,29 +108,29 @@ class TestDispatcher(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, second)
 
     def test_retrieve_rejects_unknown_key(self) -> None:
-        dispatcher = create_dispatcher()
+        conjurer = create_conjurer()
 
         with self.assertRaises(KeyError):
-            dispatcher.retrieve(DispatcherKey("missing"))
+            conjurer.retrieve(ConjurerKey("missing"))
 
-    async def test_unregister_removes_registered_service(self) -> None:
-        dispatcher = create_dispatcher()
-        _, key = dispatcher.register(ExampleService())
+    async def test_banish_removes_registered_service(self) -> None:
+        conjurer = create_conjurer()
+        _, key = conjurer.conjure(ExampleService())
 
-        removed = dispatcher.unregister(key)
+        removed = conjurer.banish(key)
 
         self.assertTrue(removed)
         with self.assertRaises(KeyError):
-            dispatcher.retrieve(key)
+            conjurer.retrieve(key)
 
-    def test_unregister_returns_false_for_unknown_key(self) -> None:
-        dispatcher = create_dispatcher()
+    def test_banish_returns_false_for_unknown_key(self) -> None:
+        conjurer = create_conjurer()
 
-        self.assertFalse(dispatcher.unregister(DispatcherKey("missing")))
+        self.assertFalse(conjurer.banish(ConjurerKey("missing")))
 
     async def test_sync_services_are_supported(self) -> None:
-        dispatcher = create_dispatcher()
-        handler, _ = dispatcher.register(ExampleErrorService())
+        conjurer = create_conjurer()
+        handler, _ = conjurer.conjure(ExampleErrorService())
 
         result = await handler.emit(ExampleData(value="boom"))
 
@@ -139,11 +139,11 @@ class TestDispatcher(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("invalid", result.error.code)
         self.assertEqual("invalid:boom", result.error.message)
 
-    async def test_register_rejects_services_without_emit(self) -> None:
-        dispatcher = create_dispatcher()
+    async def test_conjure_rejects_services_without_emit(self) -> None:
+        conjurer = create_conjurer()
 
         class InvalidService:
             pass
 
         with self.assertRaises(TypeError):
-            dispatcher.register(InvalidService())  # type: ignore[arg-type]
+            conjurer.conjure(InvalidService())  # type: ignore[arg-type]

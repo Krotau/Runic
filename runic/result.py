@@ -2,13 +2,24 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import Field, dataclass, fields, is_dataclass
+from enum import Enum
+from types import NotImplementedType
 from typing import Any, ClassVar, Generic, Literal, Protocol, TypeAlias, TypeVar, cast
 
 T = TypeVar("T", covariant=True)
 E = TypeVar("E", covariant=True)
 
 _MISMATCH = object()
+_PENDING_MARKER = object()
 _SEQUENCE_LEAF_TYPES = (str, bytes, bytearray)
+
+
+class ResultStatus(str, Enum):
+    """Closed set of states shared by all `Result` variants."""
+
+    OK = "ok"
+    PENDING = "pending"
+    ERROR = "error"
 
 
 class _SupportsDataclassFields(Protocol):
@@ -16,7 +27,11 @@ class _SupportsDataclassFields(Protocol):
 
 
 def _is_dataclass_instance(value: object) -> bool:
-    return is_dataclass(value) and not isinstance(value, type)
+    match value:
+        case type():
+            return False
+        case _:
+            return is_dataclass(value)
 
 
 def _as_dataclass_instance(value: object) -> _SupportsDataclassFields:
@@ -105,9 +120,14 @@ def _shallow_equal(left: object, right: object) -> bool:
 
 class _ResultBase:
     _payload_name: ClassVar[str]
+    _status: ClassVar[ResultStatus]
 
     def _payload(self) -> object:
         return getattr(self, self._payload_name)
+
+    @property
+    def status(self) -> ResultStatus:
+        return self._status
 
     def _coerce_other(self, other: object) -> object:
         match other:
@@ -117,6 +137,23 @@ class _ResultBase:
                 return other_result._payload()
             case _:
                 return other
+
+    def _rich_compare(self, other: object, operator: str) -> bool | NotImplementedType:
+        other_payload = self._coerce_other(other)
+        if other_payload is _MISMATCH:
+            return NotImplemented if operator != "==" else False
+
+        match operator:
+            case "==":
+                # Rich equality is intentionally shallow. Nested `Result`
+                # wrappers stay opaque here; use `.compare()` for recursion.
+                return _shallow_equal(self._payload(), other_payload)
+            case "<" | "<=" | ">" | ">=":
+                # Ordering is intentionally shallow. Only the immediate
+                # wrapped payload participates in the comparison.
+                return _compare_scalars(self._payload(), other_payload, operator)
+            case _:
+                raise ValueError(f"Unsupported comparison operator: {operator}")
 
     def compare(self, other: object) -> bool:
         """Recursively compare nested `Result` wrappers and container contents."""
@@ -135,44 +172,19 @@ class _ResultBase:
         return bool(self._payload())
 
     def __eq__(self, other: object) -> bool:
-        other_payload = self._coerce_other(other)
-        if other_payload is _MISMATCH:
-            return False
-        # Rich comparisons are shallow by design. Nested `Result` wrappers stay
-        # opaque here; use `.compare()` when recursive comparison is wanted.
-        return _shallow_equal(self._payload(), other_payload)
+        return self._rich_compare(other, "==")
 
     def __lt__(self, other: object) -> bool:
-        other_payload = self._coerce_other(other)
-        if other_payload is _MISMATCH:
-            return NotImplemented
-        # Ordering is also shallow by design. Only the immediate wrapped value
-        # participates in the comparison.
-        return _compare_scalars(self._payload(), other_payload, "<")
+        return self._rich_compare(other, "<")
 
     def __le__(self, other: object) -> bool:
-        other_payload = self._coerce_other(other)
-        if other_payload is _MISMATCH:
-            return NotImplemented
-        # Ordering is also shallow by design. Only the immediate wrapped value
-        # participates in the comparison.
-        return _compare_scalars(self._payload(), other_payload, "<=")
+        return self._rich_compare(other, "<=")
 
     def __gt__(self, other: object) -> bool:
-        other_payload = self._coerce_other(other)
-        if other_payload is _MISMATCH:
-            return NotImplemented
-        # Ordering is also shallow by design. Only the immediate wrapped value
-        # participates in the comparison.
-        return _compare_scalars(self._payload(), other_payload, ">")
+        return self._rich_compare(other, ">")
 
     def __ge__(self, other: object) -> bool:
-        other_payload = self._coerce_other(other)
-        if other_payload is _MISMATCH:
-            return NotImplemented
-        # Ordering is also shallow by design. Only the immediate wrapped value
-        # participates in the comparison.
-        return _compare_scalars(self._payload(), other_payload, ">=")
+        return self._rich_compare(other, ">=")
 
 
 @dataclass(slots=True, eq=False)
@@ -180,9 +192,24 @@ class Ok(_ResultBase, Generic[T]):
     """Represents a successful result payload."""
 
     _payload_name: ClassVar[str] = "value"
+    _status: ClassVar[ResultStatus] = ResultStatus.OK
 
     value: T
     ok: Literal[True] = True
+
+
+@dataclass(slots=True, eq=False)
+class Pending(_ResultBase):
+    """Represents work that has not completed yet."""
+
+    _payload_name: ClassVar[str] = "_marker"
+    _status: ClassVar[ResultStatus] = ResultStatus.PENDING
+
+    _marker: object = _PENDING_MARKER
+    ok: Literal[False] = False
+
+    def __bool__(self) -> bool:
+        return False
 
 
 @dataclass(slots=True, eq=False)
@@ -190,9 +217,10 @@ class Err(_ResultBase, Generic[E]):
     """Represents a failed result payload."""
 
     _payload_name: ClassVar[str] = "error"
+    _status: ClassVar[ResultStatus] = ResultStatus.ERROR
 
     error: E
     ok: Literal[False] = False
 
 
-Result: TypeAlias = Ok[T] | Err[E]
+Result: TypeAlias = Ok[T] | Pending | Err[E]

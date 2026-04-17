@@ -11,8 +11,8 @@ TData = TypeVar("TData")
 TResult = TypeVar("TResult", covariant=True)
 TError = TypeVar("TError", covariant=True)
 TService = TypeVar("TService")
-TQuery = TypeVar("TQuery", bound=Query[Any, Any])
-TCommand = TypeVar("TCommand", bound=Command[Any, Any])
+TQuery = TypeVar("TQuery", bound=Query[Any, Any], contravariant=True)
+TCommand = TypeVar("TCommand", bound=Command[Any, Any], contravariant=True)
 TQueryResult = TypeVar("TQueryResult", covariant=True)
 TQueryError = TypeVar("TQueryError", covariant=True)
 TCommandResult = TypeVar("TCommandResult", covariant=True)
@@ -71,14 +71,21 @@ class Handler(Generic[TService]):
         return self._service
 
     async def ask(self, query: Query[TQueryResult, TQueryError]) -> Result[TQueryResult, TQueryError]:
-        if self._query_adapter is None:
-            raise TypeError("Registered service does not support ask(query)")
-        return await self._query_adapter.call(query)
+        # A service may expose only one capability; missing adapters are a
+        # registration-time capability mismatch, not a recoverable runtime event.
+        match self._query_adapter:
+            case None:
+                raise TypeError("Registered service does not support ask(query)")
+            case adapter:
+                return await adapter.call(query)
 
     async def invoke(
         self,
         command: Command[TCommandResult, TCommandError],
     ) -> Result[TCommandResult, TCommandError]:
-        if self._command_adapter is None:
-            raise TypeError("Registered service does not support invoke(command)")
-        return await self._command_adapter.call(command)
+        # Same capability split as `ask(...)`: only call the adapter when it exists.
+        match self._command_adapter:
+            case None:
+                raise TypeError("Registered service does not support invoke(command)")
+            case adapter:
+                return await adapter.call(command)

@@ -2,85 +2,53 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from decimal import Decimal
 
-from runic import Command, DefaultError, Ok, Query, Runic
+from runic import Command, DefaultError, Ok, Pending, Runic
 
 
 @dataclass(slots=True)
-class GetGreeting(Query[str, DefaultError]):
+class GenerateGreetingReport(Command[dict[str, str], DefaultError]):
     name: str
-
-
-@dataclass(slots=True)
-class GetGreetingStats(Query[dict[str, Decimal], DefaultError]):
-    name: str
-
-
-@dataclass(slots=True)
-class RenameGreeting(Command[str, DefaultError]):
-    old_name: str
-    new_name: str
-
-
-@dataclass(slots=True)
-class GenerateGreetingReport:
-    name: str
-
-
-@dataclass(slots=True)
-class GreetingRequested:
-    name: str
-
-
-class GreetingService:
-    async def ask(self, query: GetGreeting) -> Ok[str]:
-        return Ok(f"hello:{query.name}")
-
-    async def invoke(self, command: RenameGreeting) -> Ok[str]:
-        return Ok(f"renamed:{command.old_name}:{command.new_name}")
-
-
-class GreetingStatsService:
-    async def ask(self, query: GetGreetingStats) -> Ok[dict[str, Decimal]]:
-        return Ok({"count": Decimal("1.00")})
 
 
 async def main() -> None:
     runic = Runic()
 
-    greeting_handler = runic.register(GreetingService())
-    stats_handler = runic.register(GreetingStatsService())
-
-    @runic.on(GreetingRequested)
-    async def on_greeting_requested(event: GreetingRequested) -> None:
-        print("event", event)
-
-    @runic.task(GenerateGreetingReport)
-    async def generate_report(ctx, req: GenerateGreetingReport) -> Ok[dict[str, str]]:
+    @runic.spell(GenerateGreetingReport)
+    async def generate_report(ctx, req: GenerateGreetingReport) -> dict[str, str]:
+        # Spells can report progress while they run and still return plain data.
         await ctx.log(f"building report for {req.name}")
+        await asyncio.sleep(0.5)
         await ctx.progress(1.0)
-        return Ok({"report": f"done:{req.name}"})
+        return {"report": f"done:{req.name}"}
 
-    await runic.emit(GreetingRequested(name="Ada"))
+    # `invoke(...)` starts the spell and returns immediately with its id, so
+    # callers can check back later.
+    deferred_spell_id = await runic.invoke(GenerateGreetingReport(name="Waiting deferly..."))
+    deferred_result = runic.conduit.get_spell_result(deferred_spell_id)
 
-    asked = await greeting_handler.ask(GetGreeting(name="Ada"))
-    invoked = await greeting_handler.invoke(RenameGreeting(old_name="Ada", new_name="Byron"))
-    results = await runic.publish(GetGreetingStats(name="Ada"))
-    direct = await stats_handler.ask(GetGreetingStats(name="Ada"))
-    job_id = await runic.start(GenerateGreetingReport(name="Ada"))
+    print("registered spell", generate_report.__name__)
+    print("deferred spell id", deferred_spell_id)
+    match deferred_result:
+        case Pending():
+            print("deferred result", "not finished yet")
+        case _:
+            print("deferred result", deferred_result)
 
-    while True:
-        record = runic.jobs.get_status(job_id)
-        if isinstance(record, Ok) and record.value.result is not None:
-            break
-        await asyncio.sleep(0.01)
+    # Once the deferred spell has had time to finish, its result is available.
+    await asyncio.sleep(2)
+    settled_result = runic.conduit.get_spell_result(deferred_spell_id)
 
-    print("asked", asked)
-    print("invoked", invoked)
-    print("published", results)
-    print("direct", direct)
-    print("job", runic.jobs.get_status(job_id))
+    # `cast(...)` starts a spell and awaits the final typed result.
+    awaited_result = await runic.cast(GenerateGreetingReport(name="Waiting awaitingly"))
+
+    print("settled result", settled_result)
+
+    match awaited_result:
+        case Ok(value=report):
+            print("cast result", report)
+        case _:
+            print("cast failed", awaited_result)
 
 
 if __name__ == "__main__":
