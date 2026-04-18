@@ -8,7 +8,7 @@ module-root = ""
 
 [project]
 name = "runic-io"
-version = "0.1.1"
+version = "0.1.3"
 description = "Small async utility library for event-driven application code."
 readme = "README.md"
 requires-python = ">=3.12"

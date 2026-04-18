@@ -4,7 +4,21 @@ import asyncio
 import unittest
 from dataclasses import dataclass
 
-from runic import Conduit, DefaultError, Err, InMemorySpellBook, Ok, Pending, SpellContext, SpellLog, SpellRecord, ResultStatus, SpellStatus, create_bus
+from runic import (
+    Conduit,
+    DefaultError,
+    Err,
+    InMemorySpellBook,
+    Ok,
+    Pending,
+    ResultStatus,
+    SpellContext,
+    SpellLog,
+    SpellRecord,
+    SpellRetryPolicy,
+    SpellStatus,
+    create_bus,
+)
 
 
 @dataclass(slots=True)
@@ -197,6 +211,71 @@ class TestConduit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("Unknown spell: missing", result.error.message)
         self.assertEqual("spell_not_found", result.error.code)
 
+    async def test_wait_returns_finished_result_without_polling(self) -> None:
+        conduit = Conduit(create_bus(dict))
+        release = asyncio.Event()
+
+        async def work(ctx):
+            await release.wait()
+            return Ok({"done": True})
+
+        spell_id = await conduit.invoke(work)
+        waiter = asyncio.create_task(conduit.wait(spell_id))
+
+        await asyncio.sleep(0.01)
+        self.assertFalse(waiter.done())
+
+        release.set()
+        result = await asyncio.wait_for(waiter, timeout=1.0)
+
+        self.assertEqual(Ok({"done": True}), result)
+
+    async def test_wait_raises_timeout_for_incomplete_spell(self) -> None:
+        conduit = Conduit(create_bus(dict))
+        release = asyncio.Event()
+
+        async def work(ctx):
+            await release.wait()
+            return Ok({"done": True})
+
+        spell_id = await conduit.invoke(work)
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await conduit.wait(spell_id, timeout=0.01)
+
+        release.set()
+        await asyncio.wait_for(conduit.wait(spell_id), timeout=1.0)
+
+    async def test_wait_for_status_returns_final_record_when_target_is_unreachable(self) -> None:
+        conduit = Conduit(create_bus(dict))
+
+        async def work(ctx):
+            return Err(DefaultError(message="failed", code="bad_request"))
+
+        spell_id = await conduit.invoke(work)
+        record = await asyncio.wait_for(conduit.wait_for_status(spell_id, SpellStatus.SUCCEEDED), timeout=1.0)
+
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertIs(SpellStatus.FAILED, record.value.status)
+        self.assertEqual("failed", record.value.error)
+
+    async def test_watch_yields_spell_specific_status_stream(self) -> None:
+        conduit = Conduit(create_bus(dict))
+
+        async def work(ctx):
+            return Ok({"done": True})
+
+        spell_id = await conduit.invoke(work, delay=0.05)
+        events = await asyncio.wait_for(self._collect_watch(conduit, spell_id), timeout=1.0)
+
+        self.assertTrue(events)
+        self.assertEqual(spell_id, events[0].spell_id)
+        self.assertEqual("pending", events[0].status)
+        self.assertTrue(all(event.spell_id == spell_id for event in events))
+        self.assertIn("running", [event.status for event in events])
+        self.assertEqual("succeeded", events[-1].status)
+
     async def test_plain_results_are_persisted_and_cleared_from_futures(self) -> None:
         conduit = Conduit(create_bus(dict))
 
@@ -308,13 +387,134 @@ class TestConduit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(f"Spell cancelled: {spell_id}", result.error.message)
         self.assertEqual("spell_cancelled", result.error.code)
 
+    async def test_retry_policy_retries_exceptions_until_success(self) -> None:
+        conduit = Conduit(create_bus(dict))
+        attempts = 0
+
+        async def work(ctx):
+            nonlocal attempts
+            attempts += 1
+            self.assertEqual(attempts, ctx.attempt)
+            self.assertEqual(3, ctx.max_attempts)
+            self.assertEqual("spell:report-1", ctx.idempotency_key)
+            if attempts < 3:
+                raise RuntimeError(f"boom:{attempts}")
+            return Ok({"attempt": ctx.attempt})
+
+        spell_id = await conduit.invoke(
+            work,
+            retry=SpellRetryPolicy(max_attempts=3),
+            idempotency_key="spell:report-1",
+        )
+        await asyncio.wait_for(self._wait_for_status(conduit, spell_id, SpellStatus.SUCCEEDED), timeout=1.0)
+
+        record = conduit.get_status(spell_id)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertEqual(3, attempts)
+        self.assertEqual(3, record.value.attempt)
+        self.assertEqual(3, record.value.max_attempts)
+        self.assertEqual("spell:report-1", record.value.idempotency_key)
+        self.assertEqual({"attempt": 3}, record.value.result)
+
+    async def test_retry_policy_retries_err_results_until_limit(self) -> None:
+        conduit = Conduit(create_bus(dict))
+        attempts = 0
+
+        async def work(ctx):
+            nonlocal attempts
+            attempts += 1
+            return Err(DefaultError(message=f"failed:{ctx.attempt}", code="bad_request"))
+
+        spell_id = await conduit.invoke(work, retry=SpellRetryPolicy(max_attempts=2))
+        await asyncio.wait_for(self._wait_for_status(conduit, spell_id, SpellStatus.FAILED), timeout=1.0)
+
+        record = conduit.get_status(spell_id)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertEqual(2, attempts)
+        self.assertEqual(2, record.value.attempt)
+        self.assertEqual(2, record.value.max_attempts)
+        self.assertEqual("failed:2", record.value.error)
+
+    async def test_delay_keeps_spell_pending_until_first_attempt(self) -> None:
+        conduit = Conduit(create_bus(dict))
+        started = asyncio.Event()
+
+        async def work(ctx):
+            started.set()
+            return Ok({"done": True})
+
+        spell_id = await conduit.invoke(work, delay=0.05)
+        record = conduit.get_status(spell_id)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertIs(SpellStatus.PENDING, record.value.status)
+        self.assertEqual(0, record.value.attempt)
+
+        await asyncio.sleep(0.01)
+        self.assertFalse(started.is_set())
+
+        await asyncio.wait_for(self._wait_for_status(conduit, spell_id, SpellStatus.SUCCEEDED), timeout=1.0)
+
+    async def test_stop_cancels_delayed_spell_before_first_attempt(self) -> None:
+        conduit = Conduit(create_bus(dict))
+        started = False
+
+        async def work(ctx):
+            nonlocal started
+            started = True
+            return Ok({"done": True})
+
+        spell_id = await conduit.invoke(work, delay=0.1)
+
+        self.assertTrue(await conduit.stop(spell_id))
+
+        record = conduit.get_status(spell_id)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertIs(SpellStatus.CANCELLED, record.value.status)
+        self.assertEqual(0, record.value.attempt)
+        self.assertFalse(started)
+
+    async def test_idempotency_key_reuses_existing_spell(self) -> None:
+        conduit = Conduit(create_bus(dict))
+        release = asyncio.Event()
+        started = asyncio.Event()
+        runs = 0
+
+        async def work(ctx):
+            nonlocal runs
+            runs += 1
+            started.set()
+            await release.wait()
+            return Ok({"runs": runs})
+
+        first_spell_id = await conduit.invoke(work, idempotency_key="widget:1")
+        second_spell_id = await conduit.invoke(work, idempotency_key="widget:1")
+
+        self.assertEqual(first_spell_id, second_spell_id)
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        await asyncio.sleep(0.01)
+        self.assertEqual(1, runs)
+
+        release.set()
+        await asyncio.wait_for(self._wait_for_status(conduit, first_spell_id, SpellStatus.SUCCEEDED), timeout=1.0)
+
+        third_spell_id = await conduit.invoke(work, idempotency_key="widget:1")
+        self.assertEqual(first_spell_id, third_spell_id)
+        await asyncio.sleep(0.01)
+        self.assertEqual(1, runs)
+
     async def _wait_for_status(self, conduit: Conduit, spell_id: str, expected: SpellStatus) -> None:
-        while True:
-            record = conduit.get_status(spell_id)
-            if isinstance(record, Ok) and record.value.status is expected:
-                return
-            await asyncio.sleep(0.01)
+        record = await conduit.wait_for_status(spell_id, expected, timeout=1.0)
+        self.assertIsInstance(record, Ok)
+        assert isinstance(record, Ok)
+        self.assertIs(expected, record.value.status)
 
     async def _wait_for_finalization(self, conduit: Conduit, spell_id: str) -> None:
         while spell_id in conduit._futures:
             await asyncio.sleep(0.01)
+
+    async def _collect_watch(self, conduit: Conduit, spell_id: str) -> list[object]:
+        return [event async for event in conduit.watch(spell_id)]

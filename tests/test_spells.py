@@ -4,7 +4,17 @@ import asyncio
 import unittest
 from dataclasses import dataclass
 
-from runic import Command, DefaultError, DuplicateRegistrationError, Err, InMemorySpellBook, Ok, Runic, TaskNotFoundError
+from runic import (
+    Command,
+    DefaultError,
+    DuplicateRegistrationError,
+    Err,
+    InMemorySpellBook,
+    Ok,
+    Runic,
+    SpellRetryPolicy,
+    TaskNotFoundError,
+)
 
 
 @dataclass(slots=True)
@@ -131,6 +141,56 @@ class TestRunicSpells(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(Err(DefaultError(message="failed:typed", code="spell_failed")), result)
 
+    async def test_cast_supports_retry_policy_for_typed_spells(self) -> None:
+        runic = Runic()
+        attempts = 0
+
+        @runic.spell(GenerateTypedReport)
+        async def generate_report(ctx, req: GenerateTypedReport):  # type: ignore[no-untyped-def]
+            nonlocal attempts
+            attempts += 1
+            if ctx.attempt == 1:
+                return Err(DefaultError(message=f"retry:{req.report_id}", code="retry"))
+            return {"report_id": req.report_id, "attempt": ctx.attempt}
+
+        result = await runic.cast(
+            GenerateTypedReport(report_id="typed"),
+            retry=SpellRetryPolicy(max_attempts=2),
+        )
+
+        self.assertEqual(2, attempts)
+        self.assertEqual(Ok({"report_id": "typed", "attempt": 2}), result)
+
+    async def test_runic_invoke_supports_idempotency_for_named_spells(self) -> None:
+        runic = Runic()
+        release = asyncio.Event()
+        started = asyncio.Event()
+        runs = 0
+
+        @runic.spell("report.generate")
+        async def generate_report(ctx, req: Ping) -> Ok[dict[str, int]]:
+            nonlocal runs
+            runs += 1
+            started.set()
+            await release.wait()
+            return Ok({"runs": runs})
+
+        first_job = await runic.invoke("report.generate", Ping(value="job"), idempotency_key="report:job")
+        second_job = await runic.invoke("report.generate", Ping(value="job"), idempotency_key="report:job")
+
+        self.assertEqual(first_job, second_job)
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        await asyncio.sleep(0.01)
+        self.assertEqual(1, runs)
+
+        release.set()
+        await asyncio.wait_for(self._wait_for_result(runic, first_job), timeout=1.0)
+
+        third_job = await runic.invoke("report.generate", Ping(value="job"), idempotency_key="report:job")
+        self.assertEqual(first_job, third_job)
+        await asyncio.sleep(0.01)
+        self.assertEqual(1, runs)
+
     async def test_runic_threads_custom_spellbook_into_spell_context(self) -> None:
         spellbook = InMemorySpellBook()
         runic = Runic(spellbook=spellbook)
@@ -193,8 +253,5 @@ class TestRunicSpells(unittest.IsolatedAsyncioTestCase):
             await runic.invoke(GenerateReport(report_id="missing"))
 
     async def _wait_for_result(self, runic: Runic, job_id: str) -> None:
-        while True:
-            record = runic.conduit.get_status(job_id)
-            if isinstance(record, Ok) and record.value.result is not None:
-                return
-            await asyncio.sleep(0.01)
+        result = await runic.conduit.wait(job_id, timeout=1.0)
+        self.assertIsInstance(result, Ok)

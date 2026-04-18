@@ -34,6 +34,8 @@ htmlcov/
 # Local environment files
 .env
 .env.*
+.local/update_dist.sh
+.local/publish_pypi.sh
 
 # Editors / OS noise
 .idea/

@@ -3,7 +3,7 @@ from __future__ import annotations
 __version__ = "0.1.0"
 
 from .spellbooks import InMemorySpellBook, InMemoryTaskBackend, SpellBook, TaskBackend
-from .conduit import Conduit, SpellContext, SpellLog, SpellRecord, SpellStatus, SpellStatusEvent
+from .conduit import Conduit, SpellContext, SpellLog, SpellRecord, SpellRetryPolicy, SpellStatus, SpellStatusEvent
 from .conjurer import Conjurable, Conjured, Conjurer, ConjurerKey, create_conjurer
 from .errors import (
     AmbiguousQueryError,
@@ -49,6 +49,7 @@ __all__ = [
     "SpellContext",
     "SpellLog",
     "SpellRecord",
+    "SpellRetryPolicy",
     "SpellStatus",
     "SpellStatusEvent",
     "SupportsAsk",

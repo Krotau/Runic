@@ -30,6 +30,40 @@ class SpellStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+_TERMINAL_SPELL_STATUSES = {SpellStatus.SUCCEEDED, SpellStatus.FAILED, SpellStatus.CANCELLED}
+_TERMINAL_SPELL_STATUS_VALUES = {status.value for status in _TERMINAL_SPELL_STATUSES}
+
+
+@dataclass(frozen=True, slots=True)
+class SpellRetryPolicy:
+    """Retry behavior for spell execution.
+
+    `max_attempts` counts the initial run plus any retries. A value of `1`
+    disables retries while still allowing the policy object to document intent.
+    """
+
+    max_attempts: int = 1
+    delay: float = 0.0
+    backoff_factor: float = 1.0
+    retry_on_err: bool = True
+    retry_on_exception: bool = True
+
+    def __post_init__(self) -> None:
+        if self.max_attempts < 1:
+            raise ValueError("Spell retry max_attempts must be at least 1")
+        if self.delay < 0.0:
+            raise ValueError("Spell retry delay must be non-negative")
+        if self.backoff_factor < 1.0:
+            raise ValueError("Spell retry backoff_factor must be at least 1.0")
+
+    def delay_for_retry(self, attempt: int) -> float:
+        """Return the backoff delay after a failed `attempt`."""
+
+        if attempt < 1:
+            raise ValueError("Retry attempts are 1-based")
+        return self.delay * (self.backoff_factor ** (attempt - 1))
+
+
 @dataclass(slots=True)
 class SpellRecord:
     """Mutable in-memory state for a tracked spell."""
@@ -40,6 +74,9 @@ class SpellRecord:
     logs: list[str] = field(default_factory=list)
     result: Any | None = None
     error: str | None = None
+    attempt: int = 0
+    max_attempts: int = 1
+    idempotency_key: str | None = None
 
 
 @dataclass(slots=True)
@@ -59,6 +96,24 @@ class SpellStatusEvent:
     progress: float
     result: Any | None = None
     error: str | None = None
+    attempt: int = 0
+    max_attempts: int = 1
+    idempotency_key: str | None = None
+
+
+def _status_payload(record: SpellRecord) -> SpellStatusEvent:
+    """Convert a spell record into a status payload snapshot."""
+
+    return SpellStatusEvent(
+        spell_id=record.spell_id,
+        status=record.status.value,
+        progress=record.progress,
+        result=_result_payload(record.result),
+        error=record.error,
+        attempt=record.attempt,
+        max_attempts=record.max_attempts,
+        idempotency_key=record.idempotency_key,
+    )
 
 
 def _error_message(error: object) -> str:
@@ -105,6 +160,9 @@ class SpellContext(Generic[TEvent]):
         record: SpellRecord,
         data: TEvent | None = None,
         shared: MutableMapping[str, Any] | None = None,
+        attempt: int = 1,
+        max_attempts: int = 1,
+        idempotency_key: str | None = None,
     ) -> None:
         self.spell_id = spell_id
         self.bus = bus
@@ -112,6 +170,9 @@ class SpellContext(Generic[TEvent]):
         self.record = record
         self.data = data
         self.shared = shared if shared is not None else {}
+        self.attempt = attempt
+        self.max_attempts = max_attempts
+        self.idempotency_key = idempotency_key
 
     async def emit(self, name: str, data: TEvent) -> None:
         """Publish a typed event on behalf of the running spell."""
@@ -143,6 +204,7 @@ class Conduit(Generic[TEvent]):
         self._log_bus: EventBus[SpellLog] = EventBus(SpellLog)
         self._records: dict[str, SpellRecord] = {}
         self._futures: dict[str, asyncio.Future[Any]] = {}
+        self._idempotency_keys: dict[str, str] = {}
 
     def get_status(self, spell_id: str) -> Result[SpellRecord, DefaultError]:
         """Return the current record for `spell_id` or an explicit lookup error."""
@@ -189,12 +251,136 @@ class Conduit(Generic[TEvent]):
 
         return self._log_bus.subscribe()
 
-    async def invoke(self, work: SpellWork[TEvent], data: TEvent | None = None) -> str:
+    def watch(self, spell_id: str) -> AsyncIterator[SpellStatusEvent]:
+        """Yield the current status snapshot and future updates for `spell_id`.
+
+        The iterator starts with the current in-memory record and then streams
+        future status changes until the spell reaches a terminal state.
+        Unknown spell ids raise `LookupError` when iteration starts.
+        """
+
+        async def iterator() -> AsyncIterator[SpellStatusEvent]:
+            subscriber = self.status_events()
+            try:
+                match self.get_status(spell_id):
+                    case Err(error=error):
+                        raise LookupError(error.message)
+                    case Ok(value=record):
+                        snapshot = _status_payload(record)
+
+                yield snapshot
+                if record.status in _TERMINAL_SPELL_STATUSES:
+                    return
+
+                async for event in subscriber:
+                    payload = event.data
+                    if payload.spell_id != spell_id:
+                        continue
+                    yield payload
+                    if payload.status in _TERMINAL_SPELL_STATUS_VALUES:
+                        return
+            finally:
+                await subscriber.aclose()
+
+        return iterator()
+
+    async def wait(self, spell_id: str, timeout: float | None = None) -> Result[Any, DefaultError]:
+        """Wait for a spell to settle and return its normalized final result."""
+
+        current = self.get_spell_result(spell_id)
+        if not isinstance(current, Pending):
+            return current
+
+        future = self._futures.get(spell_id)
+        if future is None:
+            return self.get_spell_result(spell_id)
+
+        try:
+            await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise
+        except asyncio.CancelledError:
+            if not future.cancelled():
+                raise
+        except Exception:
+            # Spell exceptions are already reflected into the spell record.
+            pass
+
+        return self.get_spell_result(spell_id)
+
+    async def wait_for_status(
+        self,
+        spell_id: str,
+        status: SpellStatus,
+        timeout: float | None = None,
+    ) -> Result[SpellRecord, DefaultError]:
+        """Wait until a spell reaches `status` or settles in a terminal state."""
+
+        async def await_status() -> Result[SpellRecord, DefaultError]:
+            subscriber = self.status_events()
+            try:
+                match self.get_status(spell_id):
+                    case Err(error=error):
+                        return Err(error)
+                    case Ok(value=record):
+                        if record.status is status or record.status in _TERMINAL_SPELL_STATUSES:
+                            return Ok(record)
+
+                async for event in subscriber:
+                    if event.data.spell_id != spell_id:
+                        continue
+                    match self.get_status(spell_id):
+                        case Err(error=error):
+                            return Err(error)
+                        case Ok(value=record):
+                            if record.status is status or record.status in _TERMINAL_SPELL_STATUSES:
+                                return Ok(record)
+            finally:
+                await subscriber.aclose()
+
+            raise AssertionError("Unreachable wait_for_status branch")
+
+        return await asyncio.wait_for(await_status(), timeout=timeout)
+
+    def _existing_spell_id(self, idempotency_key: str | None) -> str | None:
+        if idempotency_key is None:
+            return None
+        spell_id = self._idempotency_keys.get(idempotency_key)
+        if spell_id is None:
+            return None
+        if spell_id not in self._records:
+            self._idempotency_keys.pop(idempotency_key, None)
+            return None
+        return spell_id
+
+    async def invoke(
+        self,
+        work: SpellWork[TEvent],
+        data: TEvent | None = None,
+        *,
+        delay: float = 0.0,
+        retry: SpellRetryPolicy | None = None,
+        idempotency_key: str | None = None,
+    ) -> str:
         """Schedule background work and return the assigned spell id."""
 
+        if delay < 0.0:
+            raise ValueError("Spell delay must be non-negative")
+
+        existing_spell_id = self._existing_spell_id(idempotency_key)
+        if existing_spell_id is not None:
+            return existing_spell_id
+
+        retry_policy = retry or SpellRetryPolicy()
         spell_id = str(uuid4())
-        record = SpellRecord(spell_id=spell_id)
+        record = SpellRecord(
+            spell_id=spell_id,
+            max_attempts=retry_policy.max_attempts,
+            idempotency_key=idempotency_key,
+        )
         self._records[spell_id] = record
+        if idempotency_key is not None:
+            self._idempotency_keys[idempotency_key] = spell_id
         ctx = SpellContext(
             spell_id=spell_id,
             bus=self._bus,
@@ -202,57 +388,91 @@ class Conduit(Generic[TEvent]):
             record=record,
             data=data,
             shared=self.spellbook.shared,
+            attempt=0,
+            max_attempts=retry_policy.max_attempts,
+            idempotency_key=idempotency_key,
         )
 
         async def publish_status() -> None:
             await self._status_bus.publish(
                 Event(
                     name="spell_status",
-                    data=SpellStatusEvent(
-                        spell_id=spell_id,
-                        status=record.status.value,
-                        progress=record.progress,
-                        result=_result_payload(record.result),
-                        error=record.error,
-                    ),
+                    data=_status_payload(record),
                 )
             )
 
+        async def wait_in_pending(seconds: float, *, publish_pending: bool) -> None:
+            if publish_pending:
+                record.status = SpellStatus.PENDING
+                await publish_status()
+            if seconds > 0.0:
+                await asyncio.sleep(seconds)
+
         async def run_spell() -> None:
-            record.status = SpellStatus.RUNNING
-            await publish_status()
             try:
-                maybe_result = work(ctx)
-                result = await maybe_result if inspect.isawaitable(maybe_result) else maybe_result
+                if delay > 0.0:
+                    await wait_in_pending(delay, publish_pending=True)
+
+                while True:
+                    record.attempt += 1
+                    record.status = SpellStatus.RUNNING
+                    record.progress = 0.0
+                    record.result = None
+                    record.error = None
+                    ctx.attempt = record.attempt
+                    ctx.max_attempts = record.max_attempts
+                    await publish_status()
+                    try:
+                        maybe_result = work(ctx)
+                        result = await maybe_result if inspect.isawaitable(maybe_result) else maybe_result
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        record.error = str(exc)
+                        if not (retry_policy.retry_on_exception and record.attempt < retry_policy.max_attempts):
+                            record.status = SpellStatus.FAILED
+                            await publish_status()
+                            raise
+                        await wait_in_pending(
+                            retry_policy.delay_for_retry(record.attempt),
+                            publish_pending=True,
+                        )
+                        continue
+                    else:
+                        # A returned Result acts as an explicit spell outcome signal.
+                        match result:
+                            case Err(error=error):
+                                record.error = _error_message(error)
+                                record.result = None
+                                if not (retry_policy.retry_on_err and record.attempt < retry_policy.max_attempts):
+                                    record.status = SpellStatus.FAILED
+                                    await publish_status()
+                                    return
+                                await wait_in_pending(
+                                    retry_policy.delay_for_retry(record.attempt),
+                                    publish_pending=True,
+                                )
+                                continue
+                            case Ok(value=value):
+                                record.status = SpellStatus.SUCCEEDED
+                                record.error = None
+                                record.result = _result_payload(value)
+                                if record.progress < 1.0:
+                                    record.progress = 1.0
+                                await publish_status()
+                                return
+                            case _:
+                                record.status = SpellStatus.SUCCEEDED
+                                record.error = None
+                                record.result = _result_payload(result)
+                                if record.progress < 1.0:
+                                    record.progress = 1.0
+                                await publish_status()
+                                return
             except asyncio.CancelledError:
                 record.status = SpellStatus.CANCELLED
                 await publish_status()
                 raise
-            except Exception as exc:
-                record.status = SpellStatus.FAILED
-                record.error = str(exc)
-                await publish_status()
-                raise
-            else:
-                # A returned Result acts as an explicit spell outcome signal.
-                match result:
-                    case Err(error=error):
-                        record.status = SpellStatus.FAILED
-                        record.error = _error_message(error)
-                        record.result = None
-                        await publish_status()
-                    case Ok(value=value):
-                        record.status = SpellStatus.SUCCEEDED
-                        record.result = _result_payload(value)
-                        if record.progress < 1.0:
-                            record.progress = 1.0
-                        await publish_status()
-                    case _:
-                        record.status = SpellStatus.SUCCEEDED
-                        record.result = _result_payload(result)
-                        if record.progress < 1.0:
-                            record.progress = 1.0
-                        await publish_status()
 
         future = self.spellbook.submit(spell_id, run_spell)
 

@@ -8,7 +8,7 @@ The package is published on PyPI as `runic-io` and imported in Python as `runic`
 It provides:
 - a typed in-memory event bus
 - a typed service conjurer
-- a simple in-process conduit for background spells
+- a simple in-process conduit for background spells with retry, delay, and idempotency controls
 - the `Runic` runtime facade for typed queries, commands, events, and background work
 - generic request primitives
 - generic `Ok` / `Err` result types
@@ -90,7 +90,7 @@ Example: conduit
 ----------------
 
 ```python
-from runic import Conduit, Ok, create_bus
+from runic import Conduit, Ok, SpellRetryPolicy, SpellStatus, create_bus
 
 bus = create_bus(object)
 conduit = Conduit(bus)
@@ -104,13 +104,22 @@ async def work(ctx):
     return Ok({"done": True})
 
 
-spell_id = await conduit.invoke(work)
+spell_id = await conduit.invoke(
+    work,
+    delay=1.0,
+    retry=SpellRetryPolicy(max_attempts=3, delay=0.5, backoff_factor=2.0),
+    idempotency_key="report:daily",
+)
 record = conduit.get_status(spell_id)
 status = await anext(status_events)
 log = await anext(log_events)
+settled = await conduit.wait(spell_id)
+running_or_done = await conduit.wait_for_status(spell_id, SpellStatus.RUNNING)
 ```
 
 `get_status(...)` returns `Ok(SpellRecord(...))` for known spells and `Err(DefaultError(...))` for unknown spell ids.
+The spell context also exposes `attempt`, `max_attempts`, and `idempotency_key` for retry-aware work.
+Use `watch(spell_id)` to stream a single spell's status changes without filtering the shared status bus yourself.
 
 You can also pass a spellbook to share state across spells:
 
@@ -183,6 +192,7 @@ async def on_user_requested(event: UserRequested) -> None:
 await runic.emit(UserRequested(user_id=1))
 user_result = await user_handler.ask(GetUser(user_id=1))
 rename_result = await user_handler.invoke(RenameUser(user_id=1, name="Ada"))
+runtime_rename_result = await runic.execute(RenameUser(user_id=1, name="Ada"))
 all_balances = await runic.publish(GetBalance(user_id=1))
 direct_balance = await balance_handler.ask(GetBalance(user_id=1))
 ```
@@ -200,7 +210,8 @@ Public API
 
 - `create_bus(shape)` creates an in-memory event bus with runtime payload checks
 - `Conjurer` registers concrete services and retrieves typed handlers by key
-- `Conduit` runs background spells and publishes typed status/log streams
+- `Conduit` runs background spells and supports delayed execution, retries, idempotency keys, direct wait helpers, per-spell watch streams, and typed status/log streams
 - `Handler[TService]` wraps object services and exposes typed `ask(...)` and `invoke(...)`
-- `Runic` exposes typed `ask(...)`, broad-query `publish(...)`, event `emit(...)`, and `invoke(...)` helpers plus `conjure(...)`, `query(...)`, `spell(...)`, and `on(...)`
+- `Runic` exposes typed `ask(...)` and `execute(...)`, broad-query `publish(...)`, event `emit(...)`, and `invoke(...)` / `cast(...)` helpers plus `conjure(...)`, `query(...)`, `spell(...)`, and `on(...)`
+- `SpellRetryPolicy` configures spell retry attempts and exponential backoff
 - `Ok` and `Err` provide lightweight result containers

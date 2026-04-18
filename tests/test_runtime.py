@@ -152,6 +152,20 @@ class TestRunicRuntime(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(AmbiguousQueryError):
             await runic.ask(GetUser(user_id=2))
 
+    async def test_execute_routes_typed_commands(self) -> None:
+        runic = Runic()
+        runic.conjure(AccountService())
+
+        result = await runic.execute(RenameUser(user_id=1, name="Ada"))
+
+        self.assertEqual(Ok("renamed:1:Ada"), result)
+
+    async def test_execute_raises_for_missing_command_handler(self) -> None:
+        runic = Runic()
+
+        with self.assertRaises(ServiceNotFoundError):
+            await runic.execute(RenameUser(user_id=1, name="Ada"))
+
     async def test_conjure_rejects_invalid_or_duplicate_object_services(self) -> None:
         runic = Runic()
 

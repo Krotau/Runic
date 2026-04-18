@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable
 from functools import update_wrapper
 from typing import Any, Generic, ParamSpec, Protocol, TypeVar, cast, get_type_hints, overload, runtime_checkable
 
-from .conduit import Conduit, SpellContext
+from .conduit import Conduit, SpellContext, SpellRetryPolicy
 from .conjurer import AnyConjurable, Conjurable, Conjurer, ConjurerKey, create_conjurer
 from .errors import (
     AmbiguousQueryError,
@@ -20,7 +20,7 @@ from .errors import (
 from .events import Event, EventBus
 from .handlers import Handler, SupportsAsk, SupportsInvoke, _ServiceMethodAdapter
 from .requests import Command, Query, Request
-from .result import Err, Ok, Pending, Result
+from .result import Err, Ok, Result
 from .spellbooks import SpellBook
 from .spells import _FunctionSpellAdapter, _SpellDecorator
 
@@ -310,6 +310,14 @@ class Runic:
             raise AmbiguousQueryError(f"More than one service is registered for query type: {type(request).__name__}")
         return cast(Result[TResult, TError], await _await_if_needed(handlers[0](request)))
 
+    async def execute(self, command: Command[TResult, TError]) -> Result[TResult, TError]:
+        """Invoke a typed command handler using the command object's concrete type."""
+
+        handler = self._command_handlers.get(type(command))
+        if handler is None:
+            raise ServiceNotFoundError(f"Unknown command type: {type(command).__name__}")
+        return cast(Result[TResult, TError], await _await_if_needed(handler(command)))
+
     async def call(self, name: str, payload: Any = None) -> Any:
         """Invoke a named service and return its reply."""
 
@@ -320,21 +328,41 @@ class Runic:
             case Err(error=error):
                 raise error
 
-    async def invoke(self, target: str | Any, payload: Any = None) -> str:
+    async def invoke(
+        self,
+        target: str | Any,
+        payload: Any = None,
+        *,
+        delay: float = 0.0,
+        retry: SpellRetryPolicy | None = None,
+        idempotency_key: str | None = None,
+    ) -> str:
         """Invoke a named or typed spell as tracked background work."""
 
         match target:
             case str(spell_name):
                 match self._lookup_spell(spell_name):
                     case Ok(value=spell):
-                        return await self.conduit.invoke(spell, data=payload)
+                        return await self.conduit.invoke(
+                            spell,
+                            data=payload,
+                            delay=delay,
+                            retry=retry,
+                            idempotency_key=idempotency_key,
+                        )
                     case Err(error=error):
                         raise error
             case _:
                 typed_payload = target
                 match self._lookup_typed_spell(type(typed_payload)):
                     case Ok(value=spell):
-                        return await self.conduit.invoke(spell, data=typed_payload)
+                        return await self.conduit.invoke(
+                            spell,
+                            data=typed_payload,
+                            delay=delay,
+                            retry=retry,
+                            idempotency_key=idempotency_key,
+                        )
                     case Err(error=error):
                         raise error
 
@@ -346,10 +374,22 @@ class Runic:
     @overload
     async def cast(self, payload: Any) -> Result[Any, DefaultError]: ...
 
-    async def cast(self, payload: Any) -> Result[Any, DefaultError]:
+    async def cast(
+        self,
+        payload: Any,
+        *,
+        delay: float = 0.0,
+        retry: SpellRetryPolicy | None = None,
+        idempotency_key: str | None = None,
+    ) -> Result[Any, DefaultError]:
         """Invoke a typed spell and await its finished result."""
 
-        spell_id = await self.invoke(payload)
+        spell_id = await self.invoke(
+            payload,
+            delay=delay,
+            retry=retry,
+            idempotency_key=idempotency_key,
+        )
         return await self._await_spell_result(spell_id)
 
     def on(self, topic: str | type[Any]) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -503,14 +543,8 @@ class Runic:
         task.add_done_callback(finalize)
 
     async def _await_spell_result(self, spell_id: str) -> Result[Any, DefaultError]:
-        # Poll the conduit until the spell has moved out of its running states,
-        # then return the normalized result view for the finished record.
-        while True:
-            match self.conduit.get_spell_result(spell_id):
-                case Pending():
-                    await asyncio.sleep(0.01)
-                case result:
-                    return result
+        # Delegate settling to the conduit so spell waiting stays event/future driven.
+        return await self.conduit.wait(spell_id)
 
     def register(
         self,
@@ -530,12 +564,38 @@ class Runic:
 
         return self.spell(name)
 
-    async def dispatch(self, name: str, payload: Any = None) -> str:
+    async def dispatch(
+        self,
+        name: str,
+        payload: Any = None,
+        *,
+        delay: float = 0.0,
+        retry: SpellRetryPolicy | None = None,
+        idempotency_key: str | None = None,
+    ) -> str:
         """Backward-compatible alias for named `invoke(...)` calls."""
 
-        return await self.invoke(name, payload)
+        return await self.invoke(
+            name,
+            payload,
+            delay=delay,
+            retry=retry,
+            idempotency_key=idempotency_key,
+        )
 
-    async def start(self, payload: Any) -> str:
+    async def start(
+        self,
+        payload: Any,
+        *,
+        delay: float = 0.0,
+        retry: SpellRetryPolicy | None = None,
+        idempotency_key: str | None = None,
+    ) -> str:
         """Backward-compatible alias for typed `invoke(...)` calls."""
 
-        return await self.invoke(payload)
+        return await self.invoke(
+            payload,
+            delay=delay,
+            retry=retry,
+            idempotency_key=idempotency_key,
+        )
