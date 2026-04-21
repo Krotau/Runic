@@ -139,12 +139,36 @@ class TestInteractiveOllamaRunner(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("runner_chat_failed", cm.exception.error.code)
         self.assertEqual({"model": "llama3.2", "error": "boom"}, cm.exception.error.details)
 
-    async def test_list_models_parses_successful_json_lines(self) -> None:
-        async def run_command(command: tuple[str, ...]) -> Ok[list[str]]:
-            self.assertEqual(("ollama", "list", "--json"), command)
-            return Ok([json.dumps({"name": "llama3.2", "size": "2GB"})])
+    async def test_default_chat_raises_for_error_payloads(self) -> None:
+        async def chat_http(_: str, __: dict[str, object]) -> dict[str, object]:
+            return {"error": "model unavailable"}
 
-        runner = OllamaRunner(command_exists=lambda _: True, run_command=run_command)
+        runner = OllamaRunner(command_exists=lambda _: True, chat_http=chat_http)
+
+        with self.assertRaises(RunnerChatError) as cm:
+            await collect(runner.chat("llama3.2", (ChatMessage(role="user", content="hi"),)))
+
+        self.assertEqual("runner_chat_failed", cm.exception.error.code)
+        self.assertEqual({"error": "model unavailable"}, cm.exception.error.details)
+
+    async def test_default_chat_raises_for_missing_content(self) -> None:
+        async def chat_http(_: str, __: dict[str, object]) -> dict[str, object]:
+            return {"message": {"role": "assistant"}}
+
+        runner = OllamaRunner(command_exists=lambda _: True, chat_http=chat_http)
+
+        with self.assertRaises(RunnerChatError) as cm:
+            await collect(runner.chat("llama3.2", (ChatMessage(role="user", content="hi"),)))
+
+        self.assertEqual("runner_chat_failed", cm.exception.error.code)
+        self.assertEqual({"response": {"message": {"role": "assistant"}}}, cm.exception.error.details)
+
+    async def test_list_models_parses_successful_json_lines(self) -> None:
+        async def list_http(url: str) -> dict[str, object]:
+            self.assertEqual("http://127.0.0.1:11434/api/tags", url)
+            return {"models": [{"name": "llama3.2", "size": 123}]}
+
+        runner = OllamaRunner(command_exists=lambda _: True, list_http=list_http)
 
         result = await runner.list_models()
 
@@ -158,11 +182,24 @@ class TestInteractiveOllamaRunner(unittest.IsolatedAsyncioTestCase):
                     source="ollama://llama3.2",
                     runner="ollama",
                     status=ModelInstallStatus.INSTALLED,
-                    metadata={"size": "2GB"},
+                    metadata={"size": "123"},
                 )
             ],
             result.value,
         )
+
+    async def test_list_models_wraps_http_failures(self) -> None:
+        async def list_http(_: str) -> dict[str, object]:
+            raise RuntimeError("tags unavailable")
+
+        runner = OllamaRunner(command_exists=lambda _: True, list_http=list_http)
+
+        result = await runner.list_models()
+
+        self.assertIsInstance(result, Err)
+        assert isinstance(result, Err)
+        self.assertEqual("runner_list_failed", result.error.code)
+        self.assertEqual({"error": "tags unavailable"}, result.error.details)
 
     async def test_install_model_propagates_pull_failure(self) -> None:
         async def run_command(_: tuple[str, ...]) -> Err[DefaultError]:

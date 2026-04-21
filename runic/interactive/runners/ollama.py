@@ -14,9 +14,11 @@ from .base import ModelRunner, RunnerCapability, RunnerChatError, RunnerContext
 CommandExists = Callable[[str], bool]
 RunCommand = Callable[[tuple[str, ...]], Awaitable[Result[Sequence[str], DefaultError]]]
 ChatHttp = Callable[[str, dict[str, object]], Awaitable[dict[str, object]]]
+ListHttp = Callable[[str], Awaitable[dict[str, object]]]
 ChatClient = Callable[[str, tuple[ChatMessage, ...]], AsyncIterator[str]]
 
 DEFAULT_CHAT_URL = "http://127.0.0.1:11434/api/chat"
+DEFAULT_TAGS_URL = "http://127.0.0.1:11434/api/tags"
 
 
 def _default_command_exists(command: str) -> bool:
@@ -47,6 +49,10 @@ def _chat_failure(message: str, *, details: object | None = None) -> RunnerChatE
     return RunnerChatError(DefaultError(message=message, code="runner_chat_failed", details=details))
 
 
+def _list_failure(message: str, *, details: object | None = None) -> Err[DefaultError]:
+    return Err(DefaultError(message=message, code="runner_list_failed", details=details))
+
+
 def _chat_payload(model: str, messages: tuple[ChatMessage, ...]) -> dict[str, object]:
     return {
         "model": model,
@@ -55,16 +61,25 @@ def _chat_payload(model: str, messages: tuple[ChatMessage, ...]) -> dict[str, ob
     }
 
 
-def _message_content(response: object) -> str | None:
+def _chat_content_from_response(response: object) -> str:
     if not isinstance(response, dict):
-        return None
+        raise _chat_failure("Failed to chat with Ollama.", details={"response": response})
+
+    if not response:
+        raise _chat_failure("Failed to chat with Ollama.", details={"response": response})
+
+    if "error" in response:
+        raise _chat_failure("Failed to chat with Ollama.", details=response)
 
     message = response.get("message")
     if not isinstance(message, dict):
-        return None
+        raise _chat_failure("Failed to chat with Ollama.", details={"response": response})
 
     content = message.get("content")
-    return content if isinstance(content, str) else None
+    if not isinstance(content, str):
+        raise _chat_failure("Failed to chat with Ollama.", details={"response": response})
+
+    return content
 
 
 async def _default_http_chat(url: str, payload: dict[str, object]) -> dict[str, object]:
@@ -88,6 +103,21 @@ async def _default_http_chat(url: str, payload: dict[str, object]) -> dict[str, 
     return await asyncio.to_thread(_post_json)
 
 
+async def _default_http_list_models(url: str) -> dict[str, object]:
+    def _get_json() -> dict[str, object]:
+        request = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+        if not raw.strip():
+            return {}
+        decoded = json.loads(raw)
+        if not isinstance(decoded, dict):
+            raise ValueError("Ollama tags response must be a JSON object")
+        return decoded
+
+    return await asyncio.to_thread(_get_json)
+
+
 async def _default_chat_client(
     model: str,
     messages: tuple[ChatMessage, ...],
@@ -97,7 +127,7 @@ async def _default_chat_client(
     payload = _chat_payload(model, messages)
     try:
         response = await chat_http(DEFAULT_CHAT_URL, payload)
-        content = _message_content(response)
+        content = _chat_content_from_response(response)
     except RunnerChatError:
         raise
     except Exception as exc:
@@ -132,11 +162,13 @@ class OllamaRunner(ModelRunner):
         command_exists: CommandExists | None = None,
         run_command: RunCommand | None = None,
         chat_http: ChatHttp | None = None,
+        list_http: ListHttp | None = None,
         chat_client: ChatClient | None = None,
     ) -> None:
         self._command_exists = command_exists or _default_command_exists
         self._run_command = run_command or _default_run_command
         self._chat_http = chat_http or _default_http_chat
+        self._list_http = list_http or _default_http_list_models
         if chat_client is None:
 
             async def default_chat_client(model: str, messages: tuple[ChatMessage, ...]) -> AsyncIterator[str]:
@@ -181,31 +213,51 @@ class OllamaRunner(ModelRunner):
         if not await self.is_available():
             return Err(DefaultError(message="Ollama is not installed.", code="runner_unavailable"))
 
-        result = await self._run_command((self.name, "list", "--json"))
-        match result:
-            case Err() as error:
-                return error
-            case Ok() as ok:
-                models: list[InstalledModel] = []
-                for line in ok.value:
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    name = str(data.get("name", "")).strip()
-                    if not name:
-                        continue
-                    models.append(
-                        InstalledModel(
-                            name=name,
-                            provider=ModelProvider.OLLAMA,
-                            source=f"ollama://{name}",
-                            runner=self.name,
-                            status=ModelInstallStatus.INSTALLED,
-                            metadata={key: str(value) for key, value in data.items() if key != "name"},
-                        )
-                    )
-                return Ok(models)
+        try:
+            response = await self._list_http(DEFAULT_TAGS_URL)
+        except Exception as exc:
+            return _list_failure(
+                "Failed to list Ollama models.",
+                details={"error": str(exc)},
+            )
+
+        if not isinstance(response, dict):
+            return _list_failure(
+                "Failed to list Ollama models.",
+                details={"response": response},
+            )
+
+        if "error" in response:
+            return _list_failure(
+                "Failed to list Ollama models.",
+                details=response,
+            )
+
+        models_data = response.get("models")
+        if not isinstance(models_data, list):
+            return _list_failure(
+                "Failed to list Ollama models.",
+                details={"response": response},
+            )
+
+        models: list[InstalledModel] = []
+        for item in models_data:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            models.append(
+                InstalledModel(
+                    name=name,
+                    provider=ModelProvider.OLLAMA,
+                    source=f"ollama://{name}",
+                    runner=self.name,
+                    status=ModelInstallStatus.INSTALLED,
+                    metadata={key: str(value) for key, value in item.items() if key != "name"},
+                )
+            )
+        return Ok(models)
 
     def chat(self, model: str, messages: tuple[ChatMessage, ...]) -> AsyncIterator[str]:
         return self._chat_client(model, messages)
