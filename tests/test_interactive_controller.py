@@ -54,6 +54,21 @@ class FailingRunner(FakeRunner):
         return Err(DefaultError(message="install failed", code="runner_install_failed"))
 
 
+class PendingRunner(FakeRunner):
+    async def install_model(self, reference, context):  # type: ignore[no-untyped-def]
+        await context.log(f"pending:{reference.model}")
+        await context.progress(1.0)
+        return Ok(
+            InstalledModel(
+                name=reference.local_name,
+                provider=reference.provider,
+                source=reference.source,
+                runner=self.name,
+                status=ModelInstallStatus.PENDING,
+            )
+        )
+
+
 class TestInteractiveController(unittest.IsolatedAsyncioTestCase):
     async def test_prepare_install_reports_missing_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -86,6 +101,17 @@ class TestInteractiveController(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(InstallDecisionStatus.INVALID, decision.status)
             self.assertIsNone(decision.reference)
 
+    async def test_install_preserves_parser_error_code_for_invalid_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            controller = ModelController(Runic(), ModelRegistry(Path(tempdir) / "models.json"), runners=(FakeRunner(),))
+
+            result = await controller.install(" ")
+
+            self.assertIsInstance(result, Err)
+            assert isinstance(result, Err)
+            self.assertEqual("invalid_model_reference", result.error.code)
+            self.assertEqual("Invalid model reference.", result.error.message)
+
     async def test_install_schedules_spell_and_saves_registry_on_success(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             registry = ModelRegistry(Path(tempdir) / "models.json")
@@ -105,6 +131,24 @@ class TestInteractiveController(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["llama3.2"], runner.installed)
             self.assertEqual("installing:llama3.2", registry.get("llama3.2").metadata["last_log"])
             self.assertEqual(ModelInstallStatus.INSTALLED, registry.get("llama3.2").status)
+
+    async def test_install_forces_installed_status_even_when_runner_returns_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            registry = ModelRegistry(Path(tempdir) / "models.json")
+            runic = Runic()
+            runner = PendingRunner()
+            controller = ModelController(runic, registry, runners=(runner,))
+
+            result = await controller.install("llama3.2")
+
+            self.assertIsInstance(result, Ok)
+            assert isinstance(result, Ok)
+            spell_id = result.value
+            await runic.conduit.wait_for_status(spell_id, SpellStatus.SUCCEEDED, timeout=1.0)
+
+            saved = registry.get("llama3.2")
+            self.assertEqual(ModelInstallStatus.INSTALLED, saved.status)
+            self.assertEqual("pending:llama3.2", saved.metadata["last_log"])
 
     async def test_install_returns_err_and_does_not_schedule_when_runner_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -138,6 +182,19 @@ class TestInteractiveController(unittest.IsolatedAsyncioTestCase):
             assert isinstance(spell_result, Err)
             self.assertEqual(ModelInstallStatus.FAILED, registry.get("llama3.2").status)
             self.assertEqual("failed:llama3.2", registry.get("llama3.2").metadata["last_log"])
+
+    async def test_two_controllers_on_same_runtime_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            runtime = Runic()
+            ModelController(runtime, ModelRegistry(Path(tempdir) / "models-1.json"), runners=(FakeRunner(),))
+
+            with self.assertRaises(ValueError) as cm:
+                ModelController(runtime, ModelRegistry(Path(tempdir) / "models-2.json"), runners=(FakeRunner(),))
+
+            self.assertEqual(
+                "A ModelController is already registered for this Runic runtime",
+                str(cm.exception),
+            )
 
     async def test_chat_uses_registry_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

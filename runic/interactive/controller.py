@@ -30,13 +30,16 @@ class InstallDecision:
     reference: ModelReference | None = None
     runner: str | None = None
     message: str = ""
+    error_code: str | None = None
 
 
 def _decision_error(decision: InstallDecision) -> DefaultError:
-    return DefaultError(message=decision.message, code=decision.status.value)
+    return DefaultError(message=decision.message, code=decision.error_code or decision.status.value)
 
 
 class ModelController:
+    _runtime_marker = "_runic_interactive_model_controller_registered"
+
     def __init__(
         self,
         runtime: Runic,
@@ -47,12 +50,19 @@ class ModelController:
         self._registry = registry
         self._runners = tuple(runners)
         self._runners_by_name = {runner.name: runner for runner in self._runners}
+        if getattr(self._runtime, self._runtime_marker, False):
+            raise ValueError("A ModelController is already registered for this Runic runtime")
+        setattr(self._runtime, self._runtime_marker, True)
         self._runtime.spell(InstallModel)(self._install_spell)
 
     async def prepare_install(self, source: str) -> InstallDecision:
         match parse_model_reference(source):
             case Err(error=error):
-                return InstallDecision(status=InstallDecisionStatus.INVALID, message=error.message)
+                return InstallDecision(
+                    status=InstallDecisionStatus.INVALID,
+                    message=error.message,
+                    error_code=error.code,
+                )
             case Ok(value=reference):
                 compatible_runners = await self._compatible_runners(reference.provider)
                 if not compatible_runners:
@@ -209,7 +219,7 @@ class ModelController:
             provider=model.provider,
             source=model.source,
             runner=model.runner,
-            status=model.status,
+            status=ModelInstallStatus.INSTALLED,
             metadata=metadata,
         )
 
