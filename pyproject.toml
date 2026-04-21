@@ -31,17 +31,13 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/Krotau/Runic"
-Repository = "https://github.com/Krotau/Runic"
-Issues = "https://github.com/Krotau/Runic/issues"
+Homepage = "https://github.com/Krotau/Wyvern"
+Repository = "https://github.com/Krotau/Wyvern"
+Issues = "https://github.com/Krotau/Wyvern/issues"
 
 [project.optional-dependencies]
-cli = ["prompt_toolkit>=3", "rich>=13"]
 dev = ["pytest>=9.0.0"]
 release = ["build>=1.2.2", "twine>=6.1.0"]
-
-[project.scripts]
-runic = "runic.cli:main"
 
 [tool.setuptools]
 packages = ["runic"]
