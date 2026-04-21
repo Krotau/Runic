@@ -3,16 +3,20 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 from runic import DefaultError, Err, Ok, Result
 
 from ..models import ChatMessage, InstalledModel, ModelInstallStatus, ModelProvider, ModelReference
-from .base import ModelRunner, RunnerCapability, RunnerContext
+from .base import ModelRunner, RunnerCapability, RunnerChatError, RunnerContext
 
 CommandExists = Callable[[str], bool]
 RunCommand = Callable[[tuple[str, ...]], Awaitable[Result[Sequence[str], DefaultError]]]
+ChatHttp = Callable[[str, dict[str, object]], Awaitable[dict[str, object]]]
 ChatClient = Callable[[str, tuple[ChatMessage, ...]], AsyncIterator[str]]
+
+DEFAULT_CHAT_URL = "http://127.0.0.1:11434/api/chat"
 
 
 def _default_command_exists(command: str) -> bool:
@@ -39,31 +43,74 @@ async def _default_run_command(command: tuple[str, ...]) -> Result[Sequence[str]
     return Err(DefaultError(message="Runner command failed.", code="runner_command_failed", details=details))
 
 
-async def _default_chat_client(model: str, messages: tuple[ChatMessage, ...]) -> AsyncIterator[str]:
-    prompt = "\n".join(message.content for message in messages)
-    process = await asyncio.create_subprocess_exec(
-        "ollama",
-        "run",
-        model,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    assert process.stdin is not None
-    assert process.stdout is not None
-    process.stdin.write(prompt.encode("utf-8"))
-    await process.stdin.drain()
-    process.stdin.close()
+def _chat_failure(message: str, *, details: object | None = None) -> RunnerChatError:
+    return RunnerChatError(DefaultError(message=message, code="runner_chat_failed", details=details))
 
-    while True:
-        line = await process.stdout.readline()
-        if not line:
-            break
-        text = line.decode("utf-8", errors="replace")
-        if text:
-            yield text
 
-    await process.wait()
+def _chat_payload(model: str, messages: tuple[ChatMessage, ...]) -> dict[str, object]:
+    return {
+        "model": model,
+        "messages": [{"role": message.role, "content": message.content} for message in messages],
+        "stream": False,
+    }
+
+
+def _message_content(response: object) -> str | None:
+    if not isinstance(response, dict):
+        return None
+
+    message = response.get("message")
+    if not isinstance(message, dict):
+        return None
+
+    content = message.get("content")
+    return content if isinstance(content, str) else None
+
+
+async def _default_http_chat(url: str, payload: dict[str, object]) -> dict[str, object]:
+    def _post_json() -> dict[str, object]:
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+        if not raw.strip():
+            return {}
+        decoded = json.loads(raw)
+        if not isinstance(decoded, dict):
+            raise ValueError("Ollama chat response must be a JSON object")
+        return decoded
+
+    return await asyncio.to_thread(_post_json)
+
+
+async def _default_chat_client(
+    model: str,
+    messages: tuple[ChatMessage, ...],
+    *,
+    chat_http: ChatHttp,
+) -> AsyncIterator[str]:
+    payload = _chat_payload(model, messages)
+    try:
+        response = await chat_http(DEFAULT_CHAT_URL, payload)
+        content = _message_content(response)
+    except RunnerChatError:
+        raise
+    except Exception as exc:
+        raise _chat_failure(
+            "Failed to chat with Ollama.",
+            details={
+                "model": model,
+                "error": str(exc),
+            },
+        ) from exc
+
+    if content is not None:
+        yield content
 
 
 def _manual_install_error() -> Err[DefaultError]:
@@ -84,11 +131,21 @@ class OllamaRunner(ModelRunner):
         *,
         command_exists: CommandExists | None = None,
         run_command: RunCommand | None = None,
+        chat_http: ChatHttp | None = None,
         chat_client: ChatClient | None = None,
     ) -> None:
         self._command_exists = command_exists or _default_command_exists
         self._run_command = run_command or _default_run_command
-        self._chat_client = chat_client or _default_chat_client
+        self._chat_http = chat_http or _default_http_chat
+        if chat_client is None:
+
+            async def default_chat_client(model: str, messages: tuple[ChatMessage, ...]) -> AsyncIterator[str]:
+                async for chunk in _default_chat_client(model, messages, chat_http=self._chat_http):
+                    yield chunk
+
+            self._chat_client = default_chat_client
+        else:
+            self._chat_client = chat_client
 
     async def is_available(self) -> bool:
         return self._command_exists(self.name)

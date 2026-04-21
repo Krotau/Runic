@@ -23,6 +23,12 @@ class RunnerContext(Protocol):
     async def progress(self, value: float) -> object: ...
 
 
+class RunnerChatError(RuntimeError):
+    def __init__(self, error: DefaultError) -> None:
+        super().__init__(error.message)
+        self.error = error
+
+
 @runtime_checkable
 class ModelRunner(Protocol):
     name: str
