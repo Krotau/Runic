@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from runic.interactive.models import ModelProvider
+from runic.interactive.models import ChatMessage, ModelProvider
 from runic.interactive.parsing import parse_model_reference
 from runic.result import Err, Ok
 
@@ -79,3 +79,10 @@ class TestInteractiveParsing(unittest.TestCase):
         self.assertIsInstance(result, Err)
         assert isinstance(result, Err)
         self.assertEqual("invalid_model_reference", result.error.code)
+
+    def test_chat_message_dataclass_fields(self) -> None:
+        message = ChatMessage(role="user", content="hi")
+
+        self.assertEqual(ChatMessage(role="user", content="hi"), message)
+        self.assertEqual("user", message.role)
+        self.assertEqual("hi", message.content)

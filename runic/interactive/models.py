@@ -34,3 +34,9 @@ class InstalledModel:
     runner: str | None
     status: ModelInstallStatus
     metadata: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ChatMessage:
+    role: str
+    content: str
