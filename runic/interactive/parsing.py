@@ -1,73 +1,76 @@
 from __future__ import annotations
 
-from urllib.parse import urlsplit
-
-from runic import Err, Ok, Result
 from runic.errors import DefaultError
+from runic.result import Err, Ok, Result
 
-from .models import ModelReference
-
-
-def _error(message: str) -> Err[DefaultError]:
-    return Err(DefaultError(message=message))
+from .models import ModelProvider, ModelReference
 
 
-def _parse_ollama_reference(text: str) -> ModelReference | None:
-    if text.startswith("ollama://"):
-        name = text.removeprefix("ollama://").strip()
-        if not name:
-            return None
-        return ModelReference(provider="ollama", name=name, source_uri=f"ollama://{name}")
-
-    if text.startswith("http://") or text.startswith("https://"):
-        parsed = urlsplit(text)
-        if parsed.netloc != "ollama.com":
-            return None
-        path = parsed.path.strip("/")
-        if not path.startswith("library/"):
-            return None
-        name = path.removeprefix("library/").strip()
-        if not name:
-            return None
-        return ModelReference(provider="ollama", name=name, source_uri=f"ollama://{name}")
-
-    if "://" in text:
-        return None
-
-    return ModelReference(provider="ollama", name=text, source_uri=f"ollama://{text}")
+def _invalid_reference() -> Err[DefaultError]:
+    return Err(DefaultError(message="Invalid model reference.", code="invalid_model_reference"))
 
 
-def _parse_hugging_face_reference(text: str) -> ModelReference | None:
-    if not (text.startswith("http://") or text.startswith("https://")):
-        return None
-
-    parsed = urlsplit(text)
-    if parsed.netloc != "huggingface.co":
-        return None
-
-    parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) < 2:
-        return None
-
-    repo_id = f"{parts[0]}/{parts[1]}"
-    return ModelReference(
-        provider="huggingface",
-        name=repo_id,
-        source_uri=f"https://huggingface.co/{repo_id}",
-    )
+def _ollama_local_name(model: str) -> str:
+    return model
 
 
-def parse_model_reference(text: str) -> Result[ModelReference, DefaultError]:
-    cleaned = text.strip()
+def _hugging_face_local_name(model: str) -> str:
+    return model.replace("/", "-")
+
+
+def parse_model_reference(source: str) -> Result[ModelReference, DefaultError]:
+    cleaned = source.strip()
     if not cleaned:
-        return _error("Model reference is required.")
+        return _invalid_reference()
 
-    ollama_reference = _parse_ollama_reference(cleaned)
-    if ollama_reference is not None:
-        return Ok(ollama_reference)
+    if cleaned.startswith("ollama://"):
+        model = cleaned.removeprefix("ollama://")
+        if not model:
+            return _invalid_reference()
+        return Ok(
+            ModelReference(
+                provider=ModelProvider.OLLAMA,
+                source=cleaned,
+                model=model,
+                local_name=_ollama_local_name(model),
+            )
+        )
 
-    hugging_face_reference = _parse_hugging_face_reference(cleaned)
-    if hugging_face_reference is not None:
-        return Ok(hugging_face_reference)
+    if cleaned.startswith("https://ollama.com/library/"):
+        model = cleaned.removeprefix("https://ollama.com/library/")
+        if not model:
+            return _invalid_reference()
+        return Ok(
+            ModelReference(
+                provider=ModelProvider.OLLAMA,
+                source=f"ollama://{model}",
+                model=model,
+                local_name=_ollama_local_name(model),
+            )
+        )
 
-    return _error("Unsupported model reference.")
+    if cleaned.startswith("https://huggingface.co/"):
+        model = cleaned.removeprefix("https://huggingface.co/")
+        if not model or "/" not in model:
+            return _invalid_reference()
+        return Ok(
+            ModelReference(
+                provider=ModelProvider.HUGGING_FACE,
+                source=cleaned,
+                model=model,
+                local_name=_hugging_face_local_name(model),
+            )
+        )
+
+    if "://" not in cleaned:
+        model = cleaned
+        return Ok(
+            ModelReference(
+                provider=ModelProvider.OLLAMA,
+                source=f"ollama://{model}",
+                model=model,
+                local_name=_ollama_local_name(model),
+            )
+        )
+
+    return _invalid_reference()

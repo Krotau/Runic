@@ -2,46 +2,50 @@ from __future__ import annotations
 
 import unittest
 
-from runic import Err, Ok
-from runic.errors import DefaultError
+from runic.interactive.models import ModelProvider
 from runic.interactive.parsing import parse_model_reference
+from runic.result import Err, Ok
 
 
 class TestInteractiveParsing(unittest.TestCase):
-    def test_parses_plain_ollama_model_name(self) -> None:
+    def test_parse_plain_ollama_name(self) -> None:
         result = parse_model_reference("llama3.2")
 
         self.assertIsInstance(result, Ok)
-        self.assertEqual("ollama", result.value.provider)
-        self.assertEqual("llama3.2", result.value.name)
-        self.assertEqual("ollama://llama3.2", result.value.source_uri)
+        assert isinstance(result, Ok)
+        self.assertEqual(ModelProvider.OLLAMA, result.value.provider)
+        self.assertEqual("llama3.2", result.value.model)
+        self.assertEqual("llama3.2", result.value.local_name)
 
-    def test_parses_ollama_library_url(self) -> None:
+    def test_parse_ollama_uri(self) -> None:
+        result = parse_model_reference("ollama://llama3.2:1b")
+
+        self.assertIsInstance(result, Ok)
+        assert isinstance(result, Ok)
+        self.assertEqual(ModelProvider.OLLAMA, result.value.provider)
+        self.assertEqual("llama3.2:1b", result.value.model)
+        self.assertEqual("ollama://llama3.2:1b", result.value.source)
+
+    def test_parse_ollama_library_url(self) -> None:
         result = parse_model_reference("https://ollama.com/library/llama3.2")
 
         self.assertIsInstance(result, Ok)
-        self.assertEqual("ollama", result.value.provider)
-        self.assertEqual("llama3.2", result.value.name)
-        self.assertEqual("ollama://llama3.2", result.value.source_uri)
+        assert isinstance(result, Ok)
+        self.assertEqual(ModelProvider.OLLAMA, result.value.provider)
+        self.assertEqual("llama3.2", result.value.model)
 
-    def test_parses_hugging_face_url(self) -> None:
-        result = parse_model_reference("https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct")
+    def test_parse_hugging_face_url(self) -> None:
+        result = parse_model_reference("https://huggingface.co/meta-llama/Llama-3.2-1B")
 
         self.assertIsInstance(result, Ok)
-        self.assertEqual("huggingface", result.value.provider)
-        self.assertEqual("meta-llama/Llama-3.2-3B-Instruct", result.value.name)
-        self.assertEqual(
-            "https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct",
-            result.value.source_uri,
-        )
+        assert isinstance(result, Ok)
+        self.assertEqual(ModelProvider.HUGGING_FACE, result.value.provider)
+        self.assertEqual("meta-llama/Llama-3.2-1B", result.value.model)
+        self.assertEqual("meta-llama-Llama-3.2-1B", result.value.local_name)
 
-    def test_rejects_blank_input_with_default_error(self) -> None:
-        result = parse_model_reference("   ")
+    def test_parse_rejects_empty_input(self) -> None:
+        result = parse_model_reference(" ")
 
         self.assertIsInstance(result, Err)
-        self.assertIsInstance(result.error, DefaultError)
-        self.assertEqual("Model reference is required.", result.error.message)
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert isinstance(result, Err)
+        self.assertEqual("invalid_model_reference", result.error.code)
