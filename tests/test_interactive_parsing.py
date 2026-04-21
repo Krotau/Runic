@@ -71,6 +71,7 @@ class TestInteractiveParsing(unittest.TestCase):
         self.assertEqual(ModelProvider.HUGGING_FACE, result.value.provider)
         self.assertEqual("meta-llama/Llama-3.2-1B", result.value.model)
         self.assertEqual("meta-llama-Llama-3.2-1B", result.value.local_name)
+        self.assertEqual("https://huggingface.co/meta-llama/Llama-3.2-1B", result.value.source)
 
     def test_parse_rejects_empty_input(self) -> None:
         result = parse_model_reference(" ")

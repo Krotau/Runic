@@ -29,6 +29,14 @@ def _canonical_http_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
+def _hugging_face_repo_root(url: str) -> str:
+    parts = urlsplit(url)
+    segments = tuple(segment for segment in parts.path.split("/") if segment)
+    if len(segments) < 2:
+        return ""
+    return urlunsplit((parts.scheme, parts.netloc, f"/{segments[0]}/{segments[1]}", "", ""))
+
+
 def parse_model_reference(source: str) -> Result[ModelReference, DefaultError]:
     cleaned = source.strip()
     if not cleaned:
@@ -64,7 +72,7 @@ def parse_model_reference(source: str) -> Result[ModelReference, DefaultError]:
         )
 
     if cleaned.startswith("https://huggingface.co/"):
-        canonical_source = _canonical_http_url(cleaned)
+        canonical_source = _hugging_face_repo_root(cleaned)
         segments = _path_segments(cleaned)
         if len(segments) < 2:
             return _invalid_reference()
