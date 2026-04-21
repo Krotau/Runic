@@ -1,8 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from enum import Enum
-from typing import Sequence
+from collections.abc import Callable, Sequence
+from typing import Protocol
+
+from runic import DefaultError, Err, Ok, Result, Runic
+
+from .controller import ModelController
+from .models import ChatMessage
+from .registry import ModelRegistry, default_registry_path
+from .runners.ollama import OllamaRunner
+
+
+class _Console(Protocol):
+    def print(self, *objects: object, **kwargs: object) -> None: ...
+
+
+PromptFn = Callable[[str], str]
 
 
 class ShellCommand(str, Enum):
@@ -54,27 +70,74 @@ def format_install_pane(model: str, progress: float, lines: Sequence[str]) -> st
     return "\n".join(rendered)
 
 
-def run_interactive() -> int:
+def _cli_extras_message() -> str:
+    return 'Optional CLI extras are not installed. Install "runic-io[cli]" to use the interactive shell.'
+
+
+def _load_prompt_fn() -> PromptFn:
     try:
         from prompt_toolkit import prompt
     except ImportError:
-        print("Optional CLI extras are not installed. Install runic[cli] to use the interactive shell.")
-        return 1
+        raise
 
+    return prompt
+
+
+def _load_console() -> _Console:
     try:
         from rich.console import Console
     except ImportError:
-        print("Optional CLI extras are not installed. Install runic[cli] to use the interactive shell.")
+        raise
+
+    return Console()
+
+
+def _default_controller() -> ModelController:
+    runtime = Runic()
+    registry = ModelRegistry(default_registry_path())
+    return ModelController(runtime, registry, (OllamaRunner(),))
+
+
+async def _stream_chat(controller: ModelController, model: str, prompt: str, console: _Console) -> None:
+    async for chunk in controller.chat(model, (ChatMessage(role="user", content=prompt),)):
+        console.print(chunk, end="")
+    console.print()
+
+
+def _print_install_result(result: Result[str, DefaultError], console: _Console) -> None:
+    match result:
+        case Ok(value=spell_id):
+            console.print(f"Installation scheduled: {spell_id}")
+        case Err(error=error):
+            console.print(f"{error.code}: {error.message}")
+
+
+def run_interactive(
+    *,
+    controller: ModelController | None = None,
+    prompt_fn: PromptFn | None = None,
+    console: _Console | None = None,
+) -> int:
+    try:
+        active_prompt_fn = prompt_fn or _load_prompt_fn()
+    except ImportError:
+        print(_cli_extras_message())
         return 1
 
-    console = Console()
-    console.print("Runic interactive shell")
+    try:
+        active_console = console or _load_console()
+    except ImportError:
+        print(_cli_extras_message())
+        return 1
+
+    active_controller = controller or _default_controller()
+    active_console.print("Runic interactive shell")
 
     while True:
         try:
-            line = prompt("runic> ")
+            line = active_prompt_fn("runic> ")
         except (EOFError, KeyboardInterrupt):
-            console.print()
+            active_console.print()
             return 0
 
         command = parse_shell_command(line)
@@ -82,17 +145,26 @@ def run_interactive() -> int:
             case ShellCommand.EXIT:
                 return 0
             case ShellCommand.HELP:
-                console.print("Commands: install <model>, run [model], help, exit")
+                active_console.print("Commands: install <model>, run [model], help, exit")
             case ShellCommand.INSTALL:
                 if command.argument is None:
-                    console.print("Usage: install <model>")
+                    active_console.print("Model selection is not implemented yet. Use install <model>.")
                 else:
-                    console.print(format_install_pane(command.argument, 0.0, ["waiting for controller"]))
+                    result = asyncio.run(active_controller.install(command.argument))
+                    _print_install_result(result, active_console)
             case ShellCommand.RUN:
                 if command.argument is None:
-                    console.print("Usage: run <model>")
+                    active_console.print("Model selection is not implemented yet. Use run <model>.")
                 else:
-                    console.print(f"Run: {command.argument}")
+                    try:
+                        chat_prompt = active_prompt_fn(f"chat:{command.argument}> ")
+                    except (EOFError, KeyboardInterrupt):
+                        continue
+                    if chat_prompt.strip() == "/exit":
+                        continue
+                    try:
+                        asyncio.run(_stream_chat(active_controller, command.argument, chat_prompt, active_console))
+                    except LookupError as exc:
+                        active_console.print(str(exc))
             case ShellCommand.UNKNOWN:
-                console.print(f"Unknown command: {line.strip()}")
-
+                active_console.print(f"Unknown command: {line.strip()}")
