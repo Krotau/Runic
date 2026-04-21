@@ -41,7 +41,7 @@ pip install runic-io
 Optional interactive CLI
 ------------------------
 
-Runic also ships an optional prompt-first shell for local model installs and chats. Install the CLI extras first:
+Runic also ships an optional prompt-first shell for local model installs and chats. The first runner is Ollama. Install the CLI extras first:
 
 ```bash
 uv pip install "runic-io[cli]"
@@ -53,6 +53,8 @@ Then start the shell with:
 ```bash
 runic
 ```
+
+`install <model-or-link>` schedules model installation through Runic's async spell workflow. `run [model]` opens an interactive chat session for an installed model. Hugging Face links are recognized, but arbitrary Hugging Face models require a compatible runner that is not included in the first version.
 
 The interactive layer loads `prompt_toolkit` and `rich` lazily, so importing `runic` or `runic.interactive` does not require the CLI extras unless you launch the shell.
 
