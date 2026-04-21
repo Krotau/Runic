@@ -34,8 +34,37 @@ class TestInteractiveParsing(unittest.TestCase):
         self.assertEqual(ModelProvider.OLLAMA, result.value.provider)
         self.assertEqual("llama3.2", result.value.model)
 
+    def test_parse_ollama_library_url_ignores_query(self) -> None:
+        result = parse_model_reference("https://ollama.com/library/llama3.2?x=1")
+
+        self.assertIsInstance(result, Ok)
+        assert isinstance(result, Ok)
+        self.assertEqual(ModelProvider.OLLAMA, result.value.provider)
+        self.assertEqual("llama3.2", result.value.model)
+        self.assertEqual("ollama://llama3.2", result.value.source)
+
+    def test_parse_ollama_library_subpath_normalizes_to_base_model(self) -> None:
+        result = parse_model_reference("https://ollama.com/library/llama3.2/blobs/abc")
+
+        self.assertIsInstance(result, Ok)
+        assert isinstance(result, Ok)
+        self.assertEqual(ModelProvider.OLLAMA, result.value.provider)
+        self.assertEqual("llama3.2", result.value.model)
+        self.assertEqual("ollama://llama3.2", result.value.source)
+
     def test_parse_hugging_face_url(self) -> None:
         result = parse_model_reference("https://huggingface.co/meta-llama/Llama-3.2-1B")
+
+        self.assertIsInstance(result, Ok)
+        assert isinstance(result, Ok)
+        self.assertEqual(ModelProvider.HUGGING_FACE, result.value.provider)
+        self.assertEqual("meta-llama/Llama-3.2-1B", result.value.model)
+        self.assertEqual("meta-llama-Llama-3.2-1B", result.value.local_name)
+
+    def test_parse_hugging_face_url_ignores_query_and_fragment(self) -> None:
+        result = parse_model_reference(
+            "https://huggingface.co/meta-llama/Llama-3.2-1B/tree/main?foo=bar#section"
+        )
 
         self.assertIsInstance(result, Ok)
         assert isinstance(result, Ok)
