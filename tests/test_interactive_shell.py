@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import importlib
 import sys
+import tempfile
 import unittest
 from collections.abc import Callable
+from pathlib import Path
 from unittest.mock import patch
 
-from runic import Ok
-from runic.interactive.models import ChatMessage
+from runic import Err, Ok, Runic
+from runic.interactive.controller import ModelController
+from runic.interactive.models import ChatMessage, InstalledModel, ModelInstallStatus, ModelProvider
+from runic.interactive.registry import ModelRegistry
+from runic.interactive.runners.base import RunnerCapability
 import runic.cli as cli
 import runic.interactive.shell as shell
 from runic.interactive.shell import ParsedCommand, ShellCommand, format_install_pane, parse_shell_command
@@ -42,10 +48,48 @@ class FakeController:
         self.install_calls.append(model)
         return self.install_result
 
+    async def wait_for_install(self, spell_id: str) -> object:
+        return Ok({"spell_id": spell_id})
+
     async def chat(self, model: str, messages: tuple[ChatMessage, ...]):
         self.chat_calls.append((model, messages))
         for chunk in self.chat_chunks:
             yield chunk
+
+
+class CompletingRunner:
+    name = "ollama"
+    capabilities = (RunnerCapability(provider=ModelProvider.OLLAMA),)
+
+    def __init__(self) -> None:
+        self.installed: list[str] = []
+
+    async def is_available(self) -> bool:
+        return True
+
+    async def install_runner(self):  # type: ignore[no-untyped-def]
+        return Err(Exception("not used"))
+
+    async def install_model(self, reference, context):  # type: ignore[no-untyped-def]
+        await asyncio.sleep(0.01)
+        await context.log(f"installing:{reference.model}")
+        await context.progress(1.0)
+        self.installed.append(reference.model)
+        return Ok(
+            InstalledModel(
+                name=reference.local_name,
+                provider=reference.provider,
+                source=reference.source,
+                runner=self.name,
+                status=ModelInstallStatus.INSTALLED,
+            )
+        )
+
+    async def list_models(self):  # type: ignore[no-untyped-def]
+        return Ok([])
+
+    async def chat(self, model: str, messages: tuple[ChatMessage, ...]):  # type: ignore[no-untyped-def]
+        yield f"{model}:{messages[-1].content}"
 
 
 def make_prompt_fn(commands: list[str], chat_prompts: list[str]) -> Callable[[str], str]:
@@ -92,6 +136,24 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertEqual(["llama3.2"], controller.install_calls)
         self.assertIn("spell-123", console.text())
         self.assertIn("Installation scheduled", console.text())
+
+    def test_install_command_keeps_spell_alive_until_runner_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            registry = ModelRegistry(Path(tempdir) / "models.json")
+            runner = CompletingRunner()
+            controller = ModelController(Runic(), registry, runners=(runner,))
+            console = FakeConsole()
+
+            result = shell.run_interactive(
+                controller=controller,
+                prompt_fn=make_prompt_fn(["install llama3.2", "exit"], []),
+                console=console,
+            )
+
+            self.assertEqual(0, result)
+            self.assertEqual(["llama3.2"], runner.installed)
+            self.assertEqual(ModelInstallStatus.INSTALLED, registry.get("llama3.2").status)
+            self.assertIn("Installation completed", console.text())
 
     def test_run_command_prompts_chat_and_streams_chunks(self) -> None:
         controller = FakeController(chat_chunks=("hello ", "world"))

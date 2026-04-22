@@ -109,6 +109,9 @@ class ModelController:
 
         return Ok(spell_id)
 
+    async def wait_for_install(self, spell_id: str) -> Result[object, DefaultError]:
+        return await self._runtime.conduit.wait(spell_id)
+
     async def chat(self, model: str, messages: tuple[ChatMessage, ...]) -> AsyncIterator[str]:
         installed = self._registry.get(model)
         if installed.status is not ModelInstallStatus.INSTALLED:

@@ -112,6 +112,25 @@ def _print_install_result(result: Result[str, DefaultError], console: _Console) 
             console.print(f"{error.code}: {error.message}")
 
 
+def _print_install_completion(result: Result[object, DefaultError], console: _Console) -> None:
+    match result:
+        case Ok():
+            console.print("Installation completed")
+        case Err(error=error):
+            console.print(f"{error.code}: {error.message}")
+
+
+async def _install_and_wait(controller: ModelController, source: str, console: _Console) -> None:
+    result = await controller.install(source)
+    _print_install_result(result, console)
+    match result:
+        case Ok(value=spell_id):
+            settled = await controller.wait_for_install(spell_id)
+            _print_install_completion(settled, console)
+        case Err():
+            return
+
+
 def run_interactive(
     *,
     controller: ModelController | None = None,
@@ -150,8 +169,7 @@ def run_interactive(
                 if command.argument is None:
                     active_console.print("Model selection is not implemented yet. Use install <model>.")
                 else:
-                    result = asyncio.run(active_controller.install(command.argument))
-                    _print_install_result(result, active_console)
+                    asyncio.run(_install_and_wait(active_controller, command.argument, active_console))
             case ShellCommand.RUN:
                 if command.argument is None:
                     active_console.print("Model selection is not implemented yet. Use run <model>.")
