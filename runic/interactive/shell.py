@@ -46,8 +46,104 @@ class ShellCompletion:
     display_meta: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class PaneState:
+    title: str
+    lines: Sequence[str] = ()
+    footer: Sequence[str] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ShellFrame:
+    title: str
+    status: str
+    output: Sequence[str]
+    prompt: str
+    pane: PaneState | None = None
+    width: int = 80
+    height: int = 18
+
+
 COMMAND_COMPLETIONS = ("install", "chat", "embed", "help", "exit")
 MODEL_COMPLETION_COMMANDS = ("chat", "embed")
+MIN_SIDE_PANE_WIDTH = 72
+
+
+def _fit(text: object, width: int) -> str:
+    value = str(text).replace("\n", " ")
+    if width <= 0:
+        return ""
+    if len(value) > width:
+        return value[: max(0, width - 1)] + "~"
+    return value.ljust(width)
+
+
+def _frame_line(left: str, right: str, width: int) -> str:
+    gap = max(1, width - len(left) - len(right))
+    return _fit(f"{left}{' ' * gap}{right}", width)
+
+
+def _border(width: int) -> str:
+    return "+" + "-" * max(0, width - 2) + "+"
+
+
+def _row(text: object, width: int) -> str:
+    return "|" + _fit(text, max(0, width - 2)) + "|"
+
+
+def render_shell_frame(frame: ShellFrame) -> str:
+    width = max(40, frame.width)
+    height = max(7, frame.height)
+    pane = frame.pane
+    output = [str(line) for line in frame.output]
+
+    if pane is not None and width < MIN_SIDE_PANE_WIDTH:
+        rows: list[str] = [_border(width)]
+        pane_lines = [pane.title, *pane.lines, *pane.footer]
+        pane_height = min(max(1, len(pane_lines)), max(1, height - 6))
+        for line in pane_lines[:pane_height]:
+            rows.append(_row(line, width))
+        rows.append(_border(width))
+        body_height = max(1, height - len(rows) - 2)
+        for line in output[-body_height:]:
+            rows.append(_row(line, width))
+        while len(rows) < height - 2:
+            rows.append(_row("", width))
+        rows.append(_border(width))
+        rows.append(_row(frame.prompt, width))
+        rows.append(_border(width))
+        return "\n".join(rows[:height])
+
+    rows = [_border(width), _row(_frame_line(frame.title, frame.status, width - 2), width)]
+
+    if pane is None:
+        rows.append(_border(width))
+        body_height = max(1, height - 5)
+        for line in output[-body_height:]:
+            rows.append(_row(line, width))
+        while len(rows) < height - 2:
+            rows.append(_row("", width))
+        rows.append(_border(width))
+        rows.append(_row(frame.prompt, width))
+        rows.append(_border(width))
+        return "\n".join(rows[:height])
+
+    pane_width = min(28, max(22, width // 3))
+    left_width = width - pane_width - 1
+    pane_lines = [pane.title, *pane.lines]
+    if pane.footer:
+        pane_lines.extend(["", *pane.footer])
+    body_height = max(1, height - 5)
+    rows.append("+" + "-" * max(0, left_width - 2) + "+" + "-" * max(0, pane_width - 2) + "+")
+    visible_output = output[-body_height:]
+    for index in range(body_height):
+        left = visible_output[index] if index < len(visible_output) else ""
+        right = pane_lines[index] if index < len(pane_lines) else ""
+        rows.append("|" + _fit(left, left_width - 2) + "|" + _fit(right, pane_width - 2) + "|")
+    rows.append("+" + "-" * max(0, left_width - 2) + "+" + "-" * max(0, pane_width - 2) + "+")
+    rows.append(_row(frame.prompt, width))
+    rows.append(_border(width))
+    return "\n".join(rows[:height])
 
 
 def parse_shell_command(line: str) -> ParsedCommand:
@@ -196,10 +292,13 @@ def _default_controller() -> ModelController:
     return ModelController(runtime, registry, (OllamaRunner(),))
 
 
-async def _stream_chat(controller: ModelController, model: str, prompt: str, console: _Console) -> None:
+async def _stream_chat(controller: ModelController, model: str, prompt: str, console: _Console) -> str:
+    response = ""
     async for chunk in controller.chat(model, (ChatMessage(role="user", content=prompt),)):
+        response += chunk
         console.print(chunk, end="")
     console.print()
+    return response
 
 
 def _format_error(error: DefaultError) -> str:
@@ -288,6 +387,42 @@ async def _install_and_wait(controller: ModelController, source: str, console: _
             return
 
 
+def _console_width(console: _Console) -> int:
+    width = getattr(console, "width", 80)
+    return width if isinstance(width, int) else 80
+
+
+def _console_height(console: _Console) -> int:
+    height = getattr(console, "height", 18)
+    return height if isinstance(height, int) else 18
+
+
+def _redraw_frame(
+    console: _Console,
+    *,
+    output: Sequence[str],
+    prompt: str,
+    status: str = "runner: ollama ready",
+    pane: PaneState | None = None,
+) -> None:
+    clear = getattr(console, "clear", None)
+    if callable(clear):
+        clear()
+    console.print(
+        render_shell_frame(
+            ShellFrame(
+                title="Runic Interactive",
+                status=status,
+                output=output,
+                prompt=prompt,
+                pane=pane,
+                width=_console_width(console),
+                height=_console_height(console),
+            )
+        )
+    )
+
+
 def run_interactive(
     *,
     controller: ModelController | None = None,
@@ -308,10 +443,19 @@ def run_interactive(
         print(_cli_extras_message())
         return 1
 
-    active_console.print("Runic interactive shell")
+    output_lines: list[str] = ["Runic interactive shell"]
+    active_pane: PaneState | None = None
+    active_status = "runner: ollama ready"
 
     while True:
         try:
+            _redraw_frame(
+                active_console,
+                output=output_lines,
+                prompt="runic> _",
+                status=active_status,
+                pane=active_pane,
+            )
             line = active_prompt_fn("runic> ")
         except (EOFError, KeyboardInterrupt):
             active_console.print()
@@ -322,39 +466,102 @@ def run_interactive(
             case ShellCommand.EXIT:
                 return 0
             case ShellCommand.HELP:
-                active_console.print("Commands: install <model>, chat <model>, embed <model> <text-or-file-path>, help, exit")
+                message = "Commands: install <model>, chat <model>, embed <model> <text-or-file-path>, help, exit"
+                output_lines.append(message)
+                active_console.print(message)
             case ShellCommand.INSTALL:
                 if command.argument is None:
-                    active_console.print("Model selection is not implemented yet. Use install <model>.")
+                    message = "Model selection is not implemented yet. Use install <model>."
+                    output_lines.append(message)
+                    active_console.print(message)
                 else:
+                    output_lines.append(f"> install {command.argument}")
+                    output_lines.append("Resolving model reference...")
+                    active_pane = PaneState(
+                        title="Install",
+                        lines=(command.argument, "starting", "waiting for runner"),
+                        footer=("Esc: hide pane", "Enter: details"),
+                    )
+                    _redraw_frame(
+                        active_console,
+                        output=output_lines,
+                        prompt=f"runic> install {command.argument}",
+                        status=active_status,
+                        pane=active_pane,
+                    )
                     asyncio.run(_install_and_wait(active_controller, command.argument, active_console))
+                    output_lines.append("Installation completed")
+                    active_pane = PaneState(
+                        title="Install",
+                        lines=(command.argument, "############# 100%", "Installation completed"),
+                        footer=("Esc: hide pane", "Enter: details"),
+                    )
             case ShellCommand.CHAT:
                 if command.argument is None:
-                    active_console.print("Use chat <model>.")
+                    message = "Use chat <model>."
+                    output_lines.append(message)
+                    active_console.print(message)
                 else:
+                    active_status = f"model: {command.argument}"
+                    active_pane = PaneState(
+                        title="Session",
+                        lines=(
+                            f"model {command.argument}",
+                            "runner ollama",
+                            "temp default",
+                            "",
+                            "Future Context",
+                            "MCP disabled",
+                            "RAG disabled",
+                        ),
+                    )
                     try:
+                        _redraw_frame(
+                            active_console,
+                            output=output_lines,
+                            prompt=f"chat:{command.argument}> _",
+                            status=active_status,
+                            pane=active_pane,
+                        )
                         chat_prompt = active_prompt_fn(f"chat:{command.argument}> ")
                     except (EOFError, KeyboardInterrupt):
                         continue
                     if chat_prompt.strip() == "/exit":
                         continue
                     try:
-                        asyncio.run(_stream_chat(active_controller, command.argument, chat_prompt, active_console))
+                        output_lines.append(f"You: {chat_prompt}")
+                        response = asyncio.run(_stream_chat(active_controller, command.argument, chat_prompt, active_console))
+                        output_lines.append(f"Assistant: {response}")
                     except LookupError as exc:
+                        output_lines.append(str(exc))
                         active_console.print(str(exc))
                     except RunnerChatError as exc:
-                        active_console.print(_format_error(exc.error))
+                        message = _format_error(exc.error)
+                        output_lines.append(message)
+                        active_console.print(message)
             case ShellCommand.EMBED:
                 split = _split_model_and_value(command.argument, "embed")
                 match split:
                     case Err(error=error):
-                        active_console.print(_format_error(error))
+                        message = _format_error(error)
+                        output_lines.append(message)
+                        active_console.print(message)
                     case Ok(value=(model, value)):
                         embed_input = _read_embed_input(value)
                         match embed_input:
                             case Err(error=error):
-                                active_console.print(_format_error(error))
+                                message = _format_error(error)
+                                output_lines.append(message)
+                                active_console.print(message)
                             case Ok(value=text):
+                                output_lines.append(f"> embed {model} {value}")
+                                active_pane = PaneState(
+                                    title="Session",
+                                    lines=(f"model {model}", "runner ollama", "embedding mode"),
+                                )
                                 asyncio.run(_embed_and_print(active_controller, model, text, active_console))
+                                output_lines.append("Embedding completed")
             case ShellCommand.UNKNOWN:
-                active_console.print(f"Unknown command: {line.strip()}")
+                message = f"Unknown command: {line.strip()}"
+                output_lines.append(message)
+                active_console.print(message)

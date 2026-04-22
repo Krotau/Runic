@@ -18,7 +18,16 @@ from runic.interactive.registry import ModelRegistry
 from runic.interactive.runners.base import RunnerCapability, RunnerChatError
 import runic.cli as cli
 import runic.interactive.shell as shell
-from runic.interactive.shell import ParsedCommand, ShellCommand, complete_shell_input, format_install_pane, parse_shell_command
+from runic.interactive.shell import (
+    PaneState,
+    ParsedCommand,
+    ShellCommand,
+    ShellFrame,
+    complete_shell_input,
+    format_install_pane,
+    parse_shell_command,
+    render_shell_frame,
+)
 
 
 class FakeConsole:
@@ -27,6 +36,9 @@ class FakeConsole:
 
     def print(self, *objects: object, **kwargs: object) -> None:
         self.calls.append((objects, dict(kwargs)))
+
+    def clear(self) -> None:
+        self.calls.append((("[clear]",), {}))
 
     def text(self) -> str:
         parts: list[str] = []
@@ -201,6 +213,70 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertIn("82%", pane)
         self.assertTrue(all(ord(character) < 128 for character in pane))
 
+    def test_render_shell_frame_draws_install_side_pane(self) -> None:
+        frame = render_shell_frame(
+            ShellFrame(
+                title="Runic Interactive",
+                status="runner: ollama ready",
+                output=("> install ollama://llama3.2", "Resolving model reference...", "Starting Ollama pull..."),
+                prompt="runic> install https://ollama.com/library/llama3.2",
+                pane=PaneState(
+                    title="Install",
+                    lines=("llama3.2", "###########.. 82%", "downloading layers", "1.8 GB / 2.2 GB"),
+                    footer=("Esc: hide pane", "Enter: details"),
+                ),
+                width=78,
+                height=15,
+            )
+        )
+
+        self.assertIn("Runic Interactive", frame)
+        self.assertIn("runner: ollama ready", frame)
+        self.assertIn("Install", frame)
+        self.assertIn("llama3.2", frame)
+        self.assertIn("downloading layers", frame)
+        self.assertIn("runic> install", frame)
+        self.assertTrue(all(ord(character) < 128 for character in frame))
+
+    def test_render_shell_frame_collapses_pane_on_small_width(self) -> None:
+        frame = render_shell_frame(
+            ShellFrame(
+                title="Runic Interactive",
+                status="runner: ollama ready",
+                output=("Resolving model reference...",),
+                prompt="runic> _",
+                pane=PaneState(title="Install", lines=("llama3.2  ###########.. 82%", "1.8 GB / 2.2 GB")),
+                width=64,
+                height=9,
+            )
+        )
+
+        lines = frame.splitlines()
+        self.assertIn("Install", lines[1])
+        self.assertIn("llama3.2", frame)
+        self.assertIn("runic> _", frame)
+        self.assertTrue(all(len(line) == 64 for line in lines))
+
+    def test_render_shell_frame_draws_chat_session_pane(self) -> None:
+        frame = render_shell_frame(
+            ShellFrame(
+                title="Runic Interactive",
+                status="model: llama3.2",
+                output=("You: summarize this design", "Assistant: The design adds panes..."),
+                prompt="chat:llama3.2> _",
+                pane=PaneState(
+                    title="Session",
+                    lines=("model llama3.2", "runner ollama", "temp default", "", "Future Context", "MCP disabled", "RAG disabled"),
+                ),
+                width=78,
+                height=14,
+            )
+        )
+
+        self.assertIn("Session", frame)
+        self.assertIn("Future Context", frame)
+        self.assertIn("chat:llama3.2> _", frame)
+
     def test_install_command_schedules_through_controller(self) -> None:
         controller = FakeController(install_result=Ok("spell-123"))
         console = FakeConsole()
@@ -215,6 +291,7 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertEqual(["llama3.2"], controller.install_calls)
         self.assertIn("spell-123", console.text())
         self.assertIn("Installation scheduled", console.text())
+        self.assertIn("Install", console.text())
 
     def test_install_command_keeps_spell_alive_until_runner_completes(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -264,6 +341,8 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertEqual("llama3.2", controller.chat_calls[0][0])
         self.assertEqual((ChatMessage(role="user", content="Tell me more"),), controller.chat_calls[0][1])
         self.assertIn("hello world", console.text())
+        self.assertIn("Session", console.text())
+        self.assertIn("model llama3.2", console.text())
 
     def test_chat_command_prints_runner_chat_errors_without_crashing(self) -> None:
         controller = FailingChatController()
