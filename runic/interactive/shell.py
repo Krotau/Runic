@@ -412,6 +412,7 @@ def _default_controller() -> ModelController:
 
 def _run_tui_application(controller: ModelController) -> int:
     try:
+        from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
         from prompt_toolkit.application import Application
         from prompt_toolkit.application.current import get_app
         from prompt_toolkit.completion import Completer, Completion
@@ -444,21 +445,35 @@ def _run_tui_application(controller: ModelController) -> int:
         wrap_lines=True,
     )
 
+    def completion_display(text_before_cursor: str) -> ShellCompletionDisplay:
+        if state.chat_model is not None:
+            return ShellCompletionDisplay(mode=CompletionDisplayMode.NONE)
+        return classify_shell_completion(text_before_cursor, controller.list_installed())
+
     class RunicCompleter(Completer):
         def get_completions(self, document, complete_event):  # type: ignore[no-untyped-def]
-            if state.chat_model is not None:
+            display = completion_display(document.text_before_cursor)
+            if display.mode is not CompletionDisplayMode.MENU:
                 return
-            for candidate in complete_shell_input(document.text_before_cursor, controller.list_installed()):
+            for candidate in display.candidates:
                 yield Completion(
                     candidate.text,
                     start_position=candidate.start_position,
                     display_meta=candidate.display_meta,
                 )
 
+    class RunicAutoSuggest(AutoSuggest):
+        def get_suggestion(self, buffer, document):  # type: ignore[no-untyped-def]
+            display = completion_display(document.text_before_cursor)
+            if display.mode is not CompletionDisplayMode.GHOST:
+                return None
+            return Suggestion(display.ghost_text)
+
     command_area = TextArea(
         height=1,
         multiline=False,
         completer=RunicCompleter(),
+        auto_suggest=RunicAutoSuggest(),
         complete_while_typing=True,
         focusable=True,
         wrap_lines=False,
@@ -635,7 +650,12 @@ def _run_tui_application(controller: ModelController) -> int:
         buffer = command_area.buffer
         if buffer.complete_state:
             buffer.complete_next()
-        else:
+            return
+        display = completion_display(buffer.document.text_before_cursor)
+        if display.mode is CompletionDisplayMode.GHOST:
+            buffer.insert_text(display.ghost_text)
+            return
+        if display.mode is CompletionDisplayMode.MENU:
             buffer.start_completion(select_first=True)
 
     @key_bindings.add("s-tab", filter=input_focused & completion_menu_visible)
