@@ -786,4 +786,3 @@ Expected: all tests pass.
 git add README.md runic/interactive/__init__.py
 git commit -m "docs: document interactive cli"
 ```
-
