@@ -46,6 +46,19 @@ class ShellCompletion:
     display_meta: str = ""
 
 
+class CompletionDisplayMode(str, Enum):
+    NONE = "none"
+    GHOST = "ghost"
+    MENU = "menu"
+
+
+@dataclass(frozen=True, slots=True)
+class ShellCompletionDisplay:
+    mode: CompletionDisplayMode
+    candidates: tuple[ShellCompletion, ...] = ()
+    ghost_text: str = ""
+
+
 @dataclass(frozen=True, slots=True)
 class PaneState:
     title: str
@@ -296,6 +309,39 @@ def complete_shell_input(text_before_cursor: str, installed_models: Sequence[obj
         return tuple(sorted(candidates, key=lambda candidate: candidate.text))
 
     return ()
+
+
+def _completion_token_prefix(text_before_cursor: str, candidate: ShellCompletion) -> str:
+    if candidate.start_position >= 0:
+        return ""
+    prefix_length = abs(candidate.start_position)
+    if prefix_length == 0:
+        return ""
+    return text_before_cursor[-prefix_length:]
+
+
+def classify_shell_completion(text_before_cursor: str, installed_models: Sequence[object]) -> ShellCompletionDisplay:
+    candidates = complete_shell_input(text_before_cursor, installed_models)
+    if not candidates:
+        return ShellCompletionDisplay(mode=CompletionDisplayMode.NONE)
+    if len(candidates) > 1:
+        return ShellCompletionDisplay(mode=CompletionDisplayMode.MENU, candidates=candidates)
+
+    candidate = candidates[0]
+    prefix = _completion_token_prefix(text_before_cursor, candidate)
+    if not prefix and candidate.start_position != 0:
+        return ShellCompletionDisplay(mode=CompletionDisplayMode.MENU, candidates=candidates)
+    if prefix and not candidate.text.startswith(prefix):
+        return ShellCompletionDisplay(mode=CompletionDisplayMode.MENU, candidates=candidates)
+
+    ghost_text = candidate.text[len(prefix) :]
+    if not ghost_text:
+        return ShellCompletionDisplay(mode=CompletionDisplayMode.NONE)
+    return ShellCompletionDisplay(
+        mode=CompletionDisplayMode.GHOST,
+        candidates=candidates,
+        ghost_text=ghost_text,
+    )
 
 
 def _load_prompt_fn(controller: ModelController) -> PromptFn:

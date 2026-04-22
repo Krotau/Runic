@@ -19,11 +19,13 @@ from runic.interactive.runners.base import RunnerCapability, RunnerChatError
 import runic.cli as cli
 import runic.interactive.shell as shell
 from runic.interactive.shell import (
+    CompletionDisplayMode,
     PaneState,
     ParsedCommand,
     ShellCommand,
     ShellFrame,
     TuiShellState,
+    classify_shell_completion,
     complete_shell_input,
     format_install_pane,
     parse_shell_command,
@@ -182,6 +184,27 @@ class TestInteractiveShell(unittest.TestCase):
 
         self.assertEqual(["chat"], [candidate.text for candidate in candidates])
         self.assertEqual([-2], [candidate.start_position for candidate in candidates])
+
+    def test_classify_shell_completion_uses_ghost_for_single_command_match(self) -> None:
+        display = classify_shell_completion("ch", ())
+
+        self.assertEqual(CompletionDisplayMode.GHOST, display.mode)
+        self.assertEqual("at", display.ghost_text)
+        self.assertEqual(["chat"], [candidate.text for candidate in display.candidates])
+
+    def test_classify_shell_completion_uses_menu_for_ambiguous_command_match(self) -> None:
+        display = classify_shell_completion("e", ())
+
+        self.assertEqual(CompletionDisplayMode.MENU, display.mode)
+        self.assertEqual("", display.ghost_text)
+        self.assertEqual(["embed", "exit"], [candidate.text for candidate in display.candidates])
+
+    def test_classify_shell_completion_returns_none_when_there_are_no_matches(self) -> None:
+        display = classify_shell_completion("z", ())
+
+        self.assertEqual(CompletionDisplayMode.NONE, display.mode)
+        self.assertEqual("", display.ghost_text)
+        self.assertEqual([], list(display.candidates))
 
     def test_complete_shell_input_suggests_installed_models_after_chat(self) -> None:
         controller = FakeController()
