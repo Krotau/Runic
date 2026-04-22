@@ -39,6 +39,17 @@ class ParsedCommand:
     argument: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ShellCompletion:
+    text: str
+    start_position: int
+    display_meta: str = ""
+
+
+COMMAND_COMPLETIONS = ("install", "chat", "embed", "help", "exit")
+MODEL_COMPLETION_COMMANDS = ("chat", "embed")
+
+
 def parse_shell_command(line: str) -> ParsedCommand:
     text = line.strip()
     if not text:
@@ -80,13 +91,94 @@ def _cli_extras_message() -> str:
     return 'Optional CLI extras are not installed. Install "runic-io[cli]" to use the interactive shell.'
 
 
-def _load_prompt_fn() -> PromptFn:
+def complete_shell_input(text_before_cursor: str, installed_models: Sequence[object]) -> tuple[ShellCompletion, ...]:
+    if not text_before_cursor.strip() or " " not in text_before_cursor:
+        prefix = text_before_cursor.strip()
+        return tuple(
+            ShellCompletion(text=command, start_position=-len(prefix))
+            for command in COMMAND_COMPLETIONS
+            if command.startswith(prefix)
+        )
+
+    for command in MODEL_COMPLETION_COMMANDS:
+        command_prefix = f"{command} "
+        if not text_before_cursor.startswith(command_prefix):
+            continue
+
+        prefix = text_before_cursor[len(command_prefix) :]
+        if prefix.endswith(" ") and prefix.strip():
+            return ()
+        if any(character.isspace() for character in prefix.strip()):
+            return ()
+
+        candidates: list[ShellCompletion] = []
+        for model in installed_models:
+            name = str(getattr(model, "name", ""))
+            if not name or not name.startswith(prefix):
+                continue
+            runner = getattr(model, "runner", None) or "-"
+            status = getattr(getattr(model, "status", None), "value", "installed")
+            candidates.append(
+                ShellCompletion(
+                    text=name,
+                    start_position=-len(prefix),
+                    display_meta=f"{runner}  {status}",
+                )
+            )
+        return tuple(sorted(candidates, key=lambda candidate: candidate.text))
+
+    return ()
+
+
+def _load_prompt_fn(controller: ModelController) -> PromptFn:
     try:
         from prompt_toolkit import prompt
+        from prompt_toolkit.application.current import get_app
+        from prompt_toolkit.completion import Completer, Completion
+        from prompt_toolkit.shortcuts.prompt import CompleteStyle
+        from prompt_toolkit.filters import Condition
+        from prompt_toolkit.key_binding import KeyBindings
     except ImportError:
         raise
 
-    return prompt
+    class RunicCompleter(Completer):
+        def get_completions(self, document, complete_event):  # type: ignore[no-untyped-def]
+            for candidate in complete_shell_input(document.text_before_cursor, controller.list_installed()):
+                yield Completion(
+                    candidate.text,
+                    start_position=candidate.start_position,
+                    display_meta=candidate.display_meta,
+                )
+
+    key_bindings = KeyBindings()
+
+    @Condition
+    def completion_menu_visible() -> bool:
+        return bool(get_app().current_buffer.complete_state)
+
+    @key_bindings.add("enter", filter=completion_menu_visible)
+    def _(event):  # type: ignore[no-untyped-def]
+        buffer = event.app.current_buffer
+        if buffer.complete_state and buffer.complete_state.current_completion is not None:
+            buffer.apply_completion(buffer.complete_state.current_completion)
+        else:
+            buffer.validate_and_handle()
+
+    def prompt_with_completions(message: str) -> str:
+        if not message.startswith("runic>"):
+            return prompt(message)
+
+        return prompt(
+            message,
+            completer=RunicCompleter(),
+            complete_while_typing=True,
+            complete_in_thread=False,
+            complete_style=CompleteStyle.COLUMN,
+            key_bindings=key_bindings,
+            reserve_space_for_menu=6,
+        )
+
+    return prompt_with_completions
 
 
 def _load_console() -> _Console:
@@ -202,8 +294,10 @@ def run_interactive(
     prompt_fn: PromptFn | None = None,
     console: _Console | None = None,
 ) -> int:
+    active_controller = controller or _default_controller()
+
     try:
-        active_prompt_fn = prompt_fn or _load_prompt_fn()
+        active_prompt_fn = prompt_fn or _load_prompt_fn(active_controller)
     except ImportError:
         print(_cli_extras_message())
         return 1
@@ -214,7 +308,6 @@ def run_interactive(
         print(_cli_extras_message())
         return 1
 
-    active_controller = controller or _default_controller()
     active_console.print("Runic interactive shell")
 
     while True:

@@ -112,6 +112,14 @@ class ModelController:
     async def wait_for_install(self, spell_id: str) -> Result[object, DefaultError]:
         return await self._runtime.conduit.wait(spell_id)
 
+    def list_installed(self) -> tuple[InstalledModel, ...]:
+        return tuple(
+            sorted(
+                (model for model in self._registry.list() if model.status is ModelInstallStatus.INSTALLED),
+                key=lambda model: model.name,
+            )
+        )
+
     async def chat(self, model: str, messages: tuple[ChatMessage, ...]) -> AsyncIterator[str]:
         installed = self._registry.get(model)
         if installed.status is not ModelInstallStatus.INSTALLED:

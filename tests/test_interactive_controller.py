@@ -242,3 +242,28 @@ class TestInteractiveController(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(result, Ok)
             assert isinstance(result, Ok)
             self.assertEqual([18.0, 5.0], result.value)
+
+    async def test_list_installed_returns_only_installed_models(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            registry = ModelRegistry(Path(tempdir) / "models.json")
+            registry.save(
+                InstalledModel(
+                    name="llama3.2",
+                    provider=ModelProvider.OLLAMA,
+                    source="ollama://llama3.2",
+                    runner="ollama",
+                    status=ModelInstallStatus.INSTALLED,
+                )
+            )
+            registry.save(
+                InstalledModel(
+                    name="broken",
+                    provider=ModelProvider.OLLAMA,
+                    source="ollama://broken",
+                    runner="ollama",
+                    status=ModelInstallStatus.FAILED,
+                )
+            )
+            controller = ModelController(Runic(), registry, runners=(FakeRunner(),))
+
+            self.assertEqual(("llama3.2",), tuple(model.name for model in controller.list_installed()))

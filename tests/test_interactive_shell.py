@@ -18,7 +18,7 @@ from runic.interactive.registry import ModelRegistry
 from runic.interactive.runners.base import RunnerCapability, RunnerChatError
 import runic.cli as cli
 import runic.interactive.shell as shell
-from runic.interactive.shell import ParsedCommand, ShellCommand, format_install_pane, parse_shell_command
+from runic.interactive.shell import ParsedCommand, ShellCommand, complete_shell_input, format_install_pane, parse_shell_command
 
 
 class FakeConsole:
@@ -44,6 +44,22 @@ class FakeController:
         self.install_calls: list[str] = []
         self.chat_calls: list[tuple[str, tuple[ChatMessage, ...]]] = []
         self.embed_calls: list[tuple[str, str]] = []
+        self.installed = (
+            InstalledModel(
+                name="llama3.2",
+                provider=ModelProvider.OLLAMA,
+                source="ollama://llama3.2",
+                runner="ollama",
+                status=ModelInstallStatus.INSTALLED,
+            ),
+            InstalledModel(
+                name="qwen3-embedding:8b",
+                provider=ModelProvider.OLLAMA,
+                source="ollama://qwen3-embedding:8b",
+                runner="ollama",
+                status=ModelInstallStatus.INSTALLED,
+            ),
+        )
 
     async def install(self, model: str) -> object:
         self.install_calls.append(model)
@@ -60,6 +76,9 @@ class FakeController:
     async def embed(self, model: str, text: str) -> object:
         self.embed_calls.append((model, text))
         return Ok([0.1, 0.2, 0.3])
+
+    def list_installed(self) -> tuple[InstalledModel, ...]:
+        return self.installed
 
 
 class FailingChatController(FakeController):
@@ -144,6 +163,35 @@ class TestInteractiveShell(unittest.TestCase):
 
     def test_parse_exit_command(self) -> None:
         self.assertEqual(ParsedCommand(ShellCommand.EXIT, None), parse_shell_command("exit"))
+
+    def test_complete_shell_input_suggests_commands(self) -> None:
+        candidates = complete_shell_input("ch", ())
+
+        self.assertEqual(["chat"], [candidate.text for candidate in candidates])
+        self.assertEqual([-2], [candidate.start_position for candidate in candidates])
+
+    def test_complete_shell_input_suggests_installed_models_after_chat(self) -> None:
+        controller = FakeController()
+
+        candidates = complete_shell_input("chat qw", controller.list_installed())
+
+        self.assertEqual(["qwen3-embedding:8b"], [candidate.text for candidate in candidates])
+        self.assertEqual([-2], [candidate.start_position for candidate in candidates])
+        self.assertIn("ollama", candidates[0].display_meta)
+
+    def test_complete_shell_input_suggests_installed_models_after_embed(self) -> None:
+        controller = FakeController()
+
+        candidates = complete_shell_input("embed ", controller.list_installed())
+
+        self.assertEqual(["llama3.2", "qwen3-embedding:8b"], [candidate.text for candidate in candidates])
+
+    def test_complete_shell_input_stops_model_completion_after_embed_model(self) -> None:
+        controller = FakeController()
+
+        candidates = complete_shell_input("embed qwen3-embedding:8b text", controller.list_installed())
+
+        self.assertEqual((), candidates)
 
     def test_format_install_pane_is_ascii(self) -> None:
         pane = format_install_pane("llama3.2", 0.82, ["downloading layers", "1.8 GB / 2.2 GB"])
