@@ -293,6 +293,17 @@ class TestInteractiveShell(unittest.TestCase):
         state.cycle_pane_position()
         self.assertEqual("top", state.pane_position)
 
+    def test_tui_shell_state_command_section_labels(self) -> None:
+        state = TuiShellState()
+
+        self.assertEqual("Command", state.command_section_title())
+        self.assertIn("runic>", state.command_section_text())
+
+        state.enter_chat("llama3.2")
+
+        self.assertEqual("Command", state.command_section_title())
+        self.assertIn("chat:llama3.2>", state.command_section_text())
+
     def test_install_command_schedules_through_controller(self) -> None:
         controller = FakeController(install_result=Ok("spell-123"))
         console = FakeConsole()

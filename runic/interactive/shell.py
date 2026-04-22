@@ -109,7 +109,7 @@ class TuiShellState:
                     "MCP disabled",
                     "RAG disabled",
                 ),
-                footer=("Tab: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
+                footer=("F6: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
             )
         )
 
@@ -128,6 +128,12 @@ class TuiShellState:
         if self.pane.footer:
             lines.extend(["", *self.pane.footer])
         return "\n".join(str(line) for line in lines)
+
+    def command_section_title(self) -> str:
+        return "Command"
+
+    def command_section_text(self) -> str:
+        return self.prompt
 
 
 COMMAND_COMPLETIONS = ("install", "chat", "embed", "help", "exit")
@@ -423,7 +429,7 @@ def _run_tui_application(controller: ModelController) -> int:
             PaneState(
                 title="Install",
                 lines=(model, progress, *lines),
-                footer=("Tab: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
+                footer=("F6: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
             )
         )
 
@@ -514,7 +520,7 @@ def _run_tui_application(controller: ModelController) -> int:
                                     PaneState(
                                         title="Session",
                                         lines=(f"model {model}", "runner ollama", "embedding mode"),
-                                        footer=("Tab: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
+                                        footer=("F6: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
                                     )
                                 )
                                 refresh()
@@ -578,7 +584,19 @@ def _run_tui_application(controller: ModelController) -> int:
             state.append(f"Pane details: {state.pane.title}")
             refresh()
 
-    @key_bindings.add("tab")
+    @key_bindings.add("tab", filter=input_focused)
+    def _(event):  # type: ignore[no-untyped-def]
+        buffer = command_area.buffer
+        if buffer.complete_state:
+            buffer.complete_next()
+        else:
+            buffer.start_completion(select_first=True)
+
+    @key_bindings.add("s-tab", filter=input_focused & completion_menu_visible)
+    def _(event):  # type: ignore[no-untyped-def]
+        command_area.buffer.complete_previous()
+
+    @key_bindings.add("f6")
     def _(event):  # type: ignore[no-untyped-def]
         focus_order = [command_area, output_area]
         if state.pane is not None and state.pane_visible:
@@ -591,7 +609,7 @@ def _run_tui_application(controller: ModelController) -> int:
                 break
         event.app.layout.focus(focus_order[(current_index + 1) % len(focus_order)])
 
-    @key_bindings.add("s-tab")
+    @key_bindings.add("s-tab", filter=~(input_focused & completion_menu_visible))
     def _(event):  # type: ignore[no-untyped-def]
         focus_order = [command_area, output_area]
         if state.pane is not None and state.pane_visible:
@@ -628,6 +646,7 @@ def _run_tui_application(controller: ModelController) -> int:
     header = Window(FormattedTextControl(header_text), height=1)
     prompt_label = Window(FormattedTextControl(prompt_text), width=Dimension(min=8, max=32))
     input_row = VSplit([prompt_label, command_area])
+    command_section = Frame(input_row, title=state.command_section_title())
     right_body = VSplit(
         [
             Frame(output_area, title="Output"),
@@ -643,9 +662,9 @@ def _run_tui_application(controller: ModelController) -> int:
     root = HSplit(
         [
             header,
+            command_section,
             ConditionalContainer(right_body, filter=~pane_top),
             ConditionalContainer(top_body, filter=pane_top),
-            input_row,
         ]
     )
     app = Application(
