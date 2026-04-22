@@ -43,6 +43,7 @@ class FakeController:
         self.chat_chunks = chat_chunks
         self.install_calls: list[str] = []
         self.chat_calls: list[tuple[str, tuple[ChatMessage, ...]]] = []
+        self.embed_calls: list[tuple[str, str]] = []
 
     async def install(self, model: str) -> object:
         self.install_calls.append(model)
@@ -55,6 +56,10 @@ class FakeController:
         self.chat_calls.append((model, messages))
         for chunk in self.chat_chunks:
             yield chunk
+
+    async def embed(self, model: str, text: str) -> object:
+        self.embed_calls.append((model, text))
+        return Ok([0.1, 0.2, 0.3])
 
 
 class FailingChatController(FakeController):
@@ -73,7 +78,7 @@ class FailingChatController(FakeController):
 
 class CompletingRunner:
     name = "ollama"
-    capabilities = (RunnerCapability(provider=ModelProvider.OLLAMA),)
+    capabilities = (RunnerCapability(provider=ModelProvider.OLLAMA, can_embed=True),)
 
     def __init__(self) -> None:
         self.installed: list[str] = []
@@ -105,6 +110,9 @@ class CompletingRunner:
     async def chat(self, model: str, messages: tuple[ChatMessage, ...]):  # type: ignore[no-untyped-def]
         yield f"{model}:{messages[-1].content}"
 
+    async def embed(self, model: str, text: str):  # type: ignore[no-untyped-def]
+        return Ok([float(len(model)), float(len(text))])
+
 
 def make_prompt_fn(commands: list[str], chat_prompts: list[str]) -> Callable[[str], str]:
     command_iter = iter(commands)
@@ -122,8 +130,17 @@ class TestInteractiveShell(unittest.TestCase):
     def test_parse_install_command(self) -> None:
         self.assertEqual(ParsedCommand(ShellCommand.INSTALL, "llama3.2"), parse_shell_command("install llama3.2"))
 
-    def test_parse_run_command_without_model(self) -> None:
-        self.assertEqual(ParsedCommand(ShellCommand.RUN, None), parse_shell_command("run"))
+    def test_parse_chat_command_without_model(self) -> None:
+        self.assertEqual(ParsedCommand(ShellCommand.CHAT, None), parse_shell_command("chat"))
+
+    def test_parse_embed_command(self) -> None:
+        self.assertEqual(
+            ParsedCommand(ShellCommand.EMBED, 'qwen3-embedding:8b "hello world"'),
+            parse_shell_command('embed qwen3-embedding:8b "hello world"'),
+        )
+
+    def test_parse_run_is_unknown(self) -> None:
+        self.assertEqual(ParsedCommand(ShellCommand.UNKNOWN, "run llama3.2"), parse_shell_command("run llama3.2"))
 
     def test_parse_exit_command(self) -> None:
         self.assertEqual(ParsedCommand(ShellCommand.EXIT, None), parse_shell_command("exit"))
@@ -169,13 +186,28 @@ class TestInteractiveShell(unittest.TestCase):
             self.assertEqual(ModelInstallStatus.INSTALLED, registry.get("llama3.2").status)
             self.assertIn("Installation completed", console.text())
 
-    def test_run_command_prompts_chat_and_streams_chunks(self) -> None:
+    def test_help_lists_chat_and_embed_commands(self) -> None:
+        controller = FakeController()
+        console = FakeConsole()
+
+        result = shell.run_interactive(
+            controller=controller,
+            prompt_fn=make_prompt_fn(["help", "exit"], []),
+            console=console,
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn("chat <model>", console.text())
+        self.assertIn("embed <model> <text-or-file-path>", console.text())
+        self.assertNotIn("run [model]", console.text())
+
+    def test_chat_command_prompts_chat_and_streams_chunks(self) -> None:
         controller = FakeController(chat_chunks=("hello ", "world"))
         console = FakeConsole()
 
         result = shell.run_interactive(
             controller=controller,
-            prompt_fn=make_prompt_fn(["run llama3.2", "exit"], ["Tell me more"]),
+            prompt_fn=make_prompt_fn(["chat llama3.2", "exit"], ["Tell me more"]),
             console=console,
         )
 
@@ -185,13 +217,13 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertEqual((ChatMessage(role="user", content="Tell me more"),), controller.chat_calls[0][1])
         self.assertIn("hello world", console.text())
 
-    def test_run_command_prints_runner_chat_errors_without_crashing(self) -> None:
+    def test_chat_command_prints_runner_chat_errors_without_crashing(self) -> None:
         controller = FailingChatController()
         console = FakeConsole()
 
         result = shell.run_interactive(
             controller=controller,
-            prompt_fn=make_prompt_fn(["run qwen3-embedding:8b", "exit"], ["Embed this"]),
+            prompt_fn=make_prompt_fn(["chat qwen3-embedding:8b", "exit"], ["Embed this"]),
             console=console,
         )
 
@@ -200,19 +232,49 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertIn("runner_chat_failed: Failed to chat with Ollama.", console.text())
         self.assertIn("qwen3-embedding:8b does not support chat", console.text())
 
-    def test_run_exit_leaves_chat_without_controller_call(self) -> None:
+    def test_chat_exit_leaves_chat_without_controller_call(self) -> None:
         controller = FakeController(chat_chunks=("should-not-print",))
         console = FakeConsole()
 
         result = shell.run_interactive(
             controller=controller,
-            prompt_fn=make_prompt_fn(["run llama3.2", "exit"], ["/exit"]),
+            prompt_fn=make_prompt_fn(["chat llama3.2", "exit"], ["/exit"]),
             console=console,
         )
 
         self.assertEqual(0, result)
         self.assertEqual([], controller.chat_calls)
         self.assertNotIn("should-not-print", console.text())
+
+    def test_embed_command_embeds_literal_text(self) -> None:
+        controller = FakeController()
+        console = FakeConsole()
+
+        result = shell.run_interactive(
+            controller=controller,
+            prompt_fn=make_prompt_fn(['embed qwen3-embedding:8b "hello world"', "exit"], []),
+            console=console,
+        )
+
+        self.assertEqual(0, result)
+        self.assertEqual([("qwen3-embedding:8b", "hello world")], controller.embed_calls)
+        self.assertIn("Embedding dimensions: 3", console.text())
+
+    def test_embed_command_reads_existing_file_path(self) -> None:
+        controller = FakeController()
+        console = FakeConsole()
+        with tempfile.TemporaryDirectory() as tempdir:
+            path = Path(tempdir) / "input.txt"
+            path.write_text("file text", encoding="utf-8")
+
+            result = shell.run_interactive(
+                controller=controller,
+                prompt_fn=make_prompt_fn([f"embed qwen3-embedding:8b {path}", "exit"], []),
+                console=console,
+            )
+
+        self.assertEqual(0, result)
+        self.assertEqual([("qwen3-embedding:8b", "file text")], controller.embed_calls)
 
     def test_missing_optional_cli_extras_prints_hint_and_returns_one(self) -> None:
         controller = FakeController()

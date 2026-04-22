@@ -117,12 +117,23 @@ class ModelController:
         if installed.status is not ModelInstallStatus.INSTALLED:
             raise LookupError(f"Model is not installed: {model}")
 
-        runner = await self._runner_for_installed_model(installed)
+        runner = await self._runner_for_installed_model(installed, can_chat=True)
         if runner is None:
             raise LookupError(f"Runner not available for model: {model}")
 
         async for chunk in runner.chat(installed.name, messages):
             yield chunk
+
+    async def embed(self, model: str, text: str) -> Result[list[float], DefaultError]:
+        installed = self._registry.get(model)
+        if installed.status is not ModelInstallStatus.INSTALLED:
+            return Err(DefaultError(message=f"Model is not installed: {model}", code="model_not_installed"))
+
+        runner = await self._runner_for_installed_model(installed, can_embed=True)
+        if runner is None:
+            return Err(DefaultError(message=f"Runner not available for model: {model}", code="runner_unavailable"))
+
+        return await runner.embed(installed.name, text)
 
     async def _install_spell(
         self,
@@ -171,11 +182,17 @@ class ModelController:
                 runners.append(runner)
         return tuple(runners)
 
-    async def _runner_for_installed_model(self, model: InstalledModel) -> ModelRunner | None:
+    async def _runner_for_installed_model(
+        self,
+        model: InstalledModel,
+        *,
+        can_chat: bool = False,
+        can_embed: bool = False,
+    ) -> ModelRunner | None:
         runner = self._runner_by_name(model.runner or "")
         if runner is None:
             return None
-        if not self._runner_supports(runner, model.provider, can_chat=True):
+        if not self._runner_supports(runner, model.provider, can_chat=can_chat, can_embed=can_embed):
             return None
         if not await runner.is_available():
             return None
@@ -191,6 +208,7 @@ class ModelController:
         *,
         can_install: bool = False,
         can_chat: bool = False,
+        can_embed: bool = False,
     ) -> bool:
         for capability in runner.capabilities:
             if capability.provider is not provider:
@@ -198,6 +216,8 @@ class ModelController:
             if can_install and not capability.can_install:
                 continue
             if can_chat and not capability.can_chat:
+                continue
+            if can_embed and not capability.can_embed:
                 continue
             return True
         return False

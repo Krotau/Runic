@@ -14,6 +14,7 @@ class RunnerCapability:
     provider: ModelProvider
     can_install: bool = True
     can_chat: bool = True
+    can_embed: bool = False
 
 
 @runtime_checkable
@@ -45,3 +46,5 @@ class ModelRunner(Protocol):
     async def list_models(self) -> Result[list[InstalledModel], DefaultError]: ...
 
     def chat(self, model: str, messages: tuple[ChatMessage, ...]) -> AsyncIterator[str]: ...
+
+    async def embed(self, model: str, text: str) -> Result[list[float], DefaultError]: ...

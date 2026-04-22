@@ -16,9 +16,11 @@ CommandExists = Callable[[str], bool]
 RunCommand = Callable[[tuple[str, ...]], Awaitable[Result[Sequence[str], DefaultError]]]
 ChatHttp = Callable[[str, dict[str, object]], Awaitable[dict[str, object]]]
 ListHttp = Callable[[str], Awaitable[dict[str, object]]]
+EmbedHttp = Callable[[str, dict[str, object]], Awaitable[dict[str, object]]]
 ChatClient = Callable[[str, tuple[ChatMessage, ...]], AsyncIterator[str]]
 
 DEFAULT_CHAT_URL = "http://127.0.0.1:11434/api/chat"
+DEFAULT_EMBED_URL = "http://127.0.0.1:11434/api/embed"
 DEFAULT_TAGS_URL = "http://127.0.0.1:11434/api/tags"
 
 
@@ -54,12 +56,20 @@ def _list_failure(message: str, *, details: object | None = None) -> Err[Default
     return Err(DefaultError(message=message, code="runner_list_failed", details=details))
 
 
+def _embed_failure(message: str, *, details: object | None = None) -> Err[DefaultError]:
+    return Err(DefaultError(message=message, code="runner_embed_failed", details=details))
+
+
 def _chat_payload(model: str, messages: tuple[ChatMessage, ...]) -> dict[str, object]:
     return {
         "model": model,
         "messages": [{"role": message.role, "content": message.content} for message in messages],
         "stream": False,
     }
+
+
+def _embed_payload(model: str, text: str) -> dict[str, object]:
+    return {"model": model, "input": text}
 
 
 def _chat_content_from_response(response: object) -> str:
@@ -81,6 +91,33 @@ def _chat_content_from_response(response: object) -> str:
         raise _chat_failure("Failed to chat with Ollama.", details={"response": response})
 
     return content
+
+
+def _coerce_embedding(values: object, *, response: object) -> Result[list[float], DefaultError]:
+    if not isinstance(values, list):
+        return _embed_failure("Failed to embed with Ollama.", details={"response": response})
+
+    embedding: list[float] = []
+    for value in values:
+        if not isinstance(value, int | float):
+            return _embed_failure("Failed to embed with Ollama.", details={"response": response})
+        embedding.append(float(value))
+    return Ok(embedding)
+
+
+def _embedding_from_response(response: object) -> Result[list[float], DefaultError]:
+    if not isinstance(response, dict):
+        return _embed_failure("Failed to embed with Ollama.", details={"response": response})
+
+    if "error" in response:
+        return _embed_failure("Failed to embed with Ollama.", details=response)
+
+    embeddings = response.get("embeddings")
+    if isinstance(embeddings, list) and embeddings:
+        return _coerce_embedding(embeddings[0], response=response)
+
+    embedding = response.get("embedding")
+    return _coerce_embedding(embedding, response=response)
 
 
 def _http_error_details(exc: urllib.error.HTTPError) -> object:
@@ -117,6 +154,27 @@ async def _default_http_chat(url: str, payload: dict[str, object]) -> dict[str, 
         decoded = json.loads(raw)
         if not isinstance(decoded, dict):
             raise ValueError("Ollama chat response must be a JSON object")
+        return decoded
+
+    return await asyncio.to_thread(_post_json)
+
+
+async def _default_http_embed(url: str, payload: dict[str, object]) -> dict[str, object]:
+    def _post_json() -> dict[str, object]:
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8")
+        if not raw.strip():
+            return {}
+        decoded = json.loads(raw)
+        if not isinstance(decoded, dict):
+            raise ValueError("Ollama embed response must be a JSON object")
         return decoded
 
     return await asyncio.to_thread(_post_json)
@@ -175,7 +233,7 @@ def _manual_install_error() -> Err[DefaultError]:
 
 class OllamaRunner(ModelRunner):
     name = "ollama"
-    capabilities = (RunnerCapability(provider=ModelProvider.OLLAMA),)
+    capabilities = (RunnerCapability(provider=ModelProvider.OLLAMA, can_embed=True),)
 
     def __init__(
         self,
@@ -184,12 +242,14 @@ class OllamaRunner(ModelRunner):
         run_command: RunCommand | None = None,
         chat_http: ChatHttp | None = None,
         list_http: ListHttp | None = None,
+        embed_http: EmbedHttp | None = None,
         chat_client: ChatClient | None = None,
     ) -> None:
         self._command_exists = command_exists or _default_command_exists
         self._run_command = run_command or _default_run_command
         self._chat_http = chat_http or _default_http_chat
         self._list_http = list_http or _default_http_list_models
+        self._embed_http = embed_http or _default_http_embed
         if chat_client is None:
 
             async def default_chat_client(model: str, messages: tuple[ChatMessage, ...]) -> AsyncIterator[str]:
@@ -282,3 +342,19 @@ class OllamaRunner(ModelRunner):
 
     def chat(self, model: str, messages: tuple[ChatMessage, ...]) -> AsyncIterator[str]:
         return self._chat_client(model, messages)
+
+    async def embed(self, model: str, text: str) -> Result[list[float], DefaultError]:
+        if not await self.is_available():
+            return Err(DefaultError(message="Ollama is not installed.", code="runner_unavailable"))
+
+        try:
+            response = await self._embed_http(DEFAULT_EMBED_URL, _embed_payload(model, text))
+        except urllib.error.HTTPError as exc:
+            return _embed_failure("Failed to embed with Ollama.", details=_http_error_details(exc))
+        except Exception as exc:
+            return _embed_failure(
+                "Failed to embed with Ollama.",
+                details={"model": model, "error": str(exc)},
+            )
+
+        return _embedding_from_response(response)

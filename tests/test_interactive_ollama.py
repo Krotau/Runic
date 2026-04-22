@@ -129,6 +129,37 @@ class TestInteractiveOllamaRunner(unittest.IsolatedAsyncioTestCase):
             captured["payload"],
         )
 
+    async def test_embed_posts_to_ollama_embed_endpoint(self) -> None:
+        captured: dict[str, object] = {}
+
+        async def embed_http(url: str, payload: dict[str, object]) -> dict[str, object]:
+            captured["url"] = url
+            captured["payload"] = payload
+            return {"embeddings": [[0.1, 0.2, 0.3]]}
+
+        runner = OllamaRunner(command_exists=lambda _: True, embed_http=embed_http)
+
+        result = await runner.embed("qwen3-embedding:8b", "hello")
+
+        self.assertIsInstance(result, Ok)
+        assert isinstance(result, Ok)
+        self.assertEqual([0.1, 0.2, 0.3], result.value)
+        self.assertEqual("http://127.0.0.1:11434/api/embed", captured["url"])
+        self.assertEqual({"model": "qwen3-embedding:8b", "input": "hello"}, captured["payload"])
+
+    async def test_embed_returns_error_payloads(self) -> None:
+        async def embed_http(_: str, __: dict[str, object]) -> dict[str, object]:
+            return {"error": "model does not support embeddings"}
+
+        runner = OllamaRunner(command_exists=lambda _: True, embed_http=embed_http)
+
+        result = await runner.embed("llama3.2", "hello")
+
+        self.assertIsInstance(result, Err)
+        assert isinstance(result, Err)
+        self.assertEqual("runner_embed_failed", result.error.code)
+        self.assertEqual({"error": "model does not support embeddings"}, result.error.details)
+
     async def test_default_chat_wraps_http_failures(self) -> None:
         async def chat_http(_: str, __: dict[str, object]) -> dict[str, object]:
             raise RuntimeError("boom")

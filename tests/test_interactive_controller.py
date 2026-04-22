@@ -18,7 +18,7 @@ class FakeRunner:
         from runic.interactive.runners.base import RunnerCapability
 
         self.available = available
-        self.capabilities = (RunnerCapability(provider=ModelProvider.OLLAMA),)
+        self.capabilities = (RunnerCapability(provider=ModelProvider.OLLAMA, can_embed=True),)
         self.installed: list[str] = []
 
     async def is_available(self) -> bool:
@@ -46,6 +46,9 @@ class FakeRunner:
 
     async def chat(self, model: str, messages: tuple[ChatMessage, ...]) -> AsyncIterator[str]:
         yield f"{model}:{messages[-1].content}"
+
+    async def embed(self, model: str, text: str):  # type: ignore[no-untyped-def]
+        return Ok([float(len(model)), float(len(text))])
 
 
 class FailingRunner(FakeRunner):
@@ -219,3 +222,23 @@ class TestInteractiveController(unittest.IsolatedAsyncioTestCase):
             ]
 
             self.assertEqual(["llama3.2:hello"], chunks)
+
+    async def test_embed_uses_registry_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            registry = ModelRegistry(Path(tempdir) / "models.json")
+            registry.save(
+                InstalledModel(
+                    name="qwen3-embedding:8b",
+                    provider=ModelProvider.OLLAMA,
+                    source="ollama://qwen3-embedding:8b",
+                    runner="ollama",
+                    status=ModelInstallStatus.INSTALLED,
+                )
+            )
+            controller = ModelController(Runic(), registry, runners=(FakeRunner(),))
+
+            result = await controller.embed("qwen3-embedding:8b", "hello")
+
+            self.assertIsInstance(result, Ok)
+            assert isinstance(result, Ok)
+            self.assertEqual([18.0, 5.0], result.value)
