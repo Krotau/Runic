@@ -354,12 +354,28 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertTrue(state.pane_visible)
         self.assertIn("Session", state.pane_text())
         self.assertIn("model llama3.2", state.pane_text())
+        self.assertNotIn("F6: focus pane", state.pane_text())
+        self.assertNotIn("Esc: hide pane", state.pane_text())
+        self.assertNotIn("Ctrl-P: move pane", state.pane_text())
 
         state.hide_pane()
         self.assertFalse(state.pane_visible)
 
         state.cycle_pane_position()
         self.assertEqual("top", state.pane_position)
+
+    def test_tui_shell_state_footer_lists_shortcuts(self) -> None:
+        state = TuiShellState()
+
+        footer = state.footer_text()
+
+        self.assertIn("Tab accept/next", footer)
+        self.assertIn("Enter run/select", footer)
+        self.assertIn("Shift-Tab previous", footer)
+        self.assertIn("F6 focus", footer)
+        self.assertIn("Esc hide pane", footer)
+        self.assertIn("Ctrl-P move pane", footer)
+        self.assertIn("Ctrl-Q quit", footer)
 
     def test_tui_shell_state_command_section_labels(self) -> None:
         state = TuiShellState()

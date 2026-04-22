@@ -122,7 +122,6 @@ class TuiShellState:
                     "MCP disabled",
                     "RAG disabled",
                 ),
-                footer=("F6: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
             )
         )
 
@@ -147,6 +146,9 @@ class TuiShellState:
 
     def command_section_text(self) -> str:
         return self.prompt
+
+    def footer_text(self) -> str:
+        return "Tab accept/next | Enter run/select | Shift-Tab previous | F6 focus | Esc hide pane | Ctrl-P move pane | Ctrl-Q quit"
 
 
 COMMAND_COMPLETIONS = ("install", "chat", "embed", "help", "exit")
@@ -490,7 +492,6 @@ def _run_tui_application(controller: ModelController) -> int:
             PaneState(
                 title="Install",
                 lines=(model, progress, *lines),
-                footer=("F6: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
             )
         )
 
@@ -581,7 +582,6 @@ def _run_tui_application(controller: ModelController) -> int:
                                     PaneState(
                                         title="Session",
                                         lines=(f"model {model}", "runner ollama", "embedding mode"),
-                                        footer=("F6: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
                                     )
                                 )
                                 refresh()
@@ -709,7 +709,11 @@ def _run_tui_application(controller: ModelController) -> int:
     def prompt_text():
         return FormattedText([("class:prompt", state.prompt)])
 
+    def footer_text():
+        return FormattedText([("class:footer", state.footer_text())])
+
     header = Window(FormattedTextControl(header_text), height=1)
+    footer = Window(FormattedTextControl(footer_text), height=1)
     prompt_label = Window(FormattedTextControl(prompt_text), width=Dimension(min=8, max=32))
     input_row = VSplit([prompt_label, command_area])
     command_section = Frame(input_row, title=state.command_section_title())
@@ -731,6 +735,7 @@ def _run_tui_application(controller: ModelController) -> int:
             command_section,
             ConditionalContainer(right_body, filter=~pane_top),
             ConditionalContainer(top_body, filter=pane_top),
+            footer,
         ]
     )
     app = Application(
