@@ -215,6 +215,24 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertEqual([-2], [candidate.start_position for candidate in candidates])
         self.assertIn("ollama", candidates[0].display_meta)
 
+    def test_classify_shell_completion_uses_ghost_for_single_chat_model_match(self) -> None:
+        controller = FakeController()
+
+        display = classify_shell_completion("chat qw", controller.list_installed())
+
+        self.assertEqual(CompletionDisplayMode.GHOST, display.mode)
+        self.assertEqual("en3-embedding:8b", display.ghost_text)
+        self.assertEqual(["qwen3-embedding:8b"], [candidate.text for candidate in display.candidates])
+
+    def test_classify_shell_completion_uses_menu_for_ambiguous_chat_model_match(self) -> None:
+        controller = FakeController()
+
+        display = classify_shell_completion("chat ", controller.list_installed())
+
+        self.assertEqual(CompletionDisplayMode.MENU, display.mode)
+        self.assertEqual("", display.ghost_text)
+        self.assertEqual(["llama3.2", "qwen3-embedding:8b"], [candidate.text for candidate in display.candidates])
+
     def test_complete_shell_input_suggests_installed_models_after_embed(self) -> None:
         controller = FakeController()
 
@@ -222,12 +240,39 @@ class TestInteractiveShell(unittest.TestCase):
 
         self.assertEqual(["llama3.2", "qwen3-embedding:8b"], [candidate.text for candidate in candidates])
 
+    def test_classify_shell_completion_uses_ghost_for_single_embed_model_match(self) -> None:
+        controller = FakeController()
+
+        display = classify_shell_completion("embed qw", controller.list_installed())
+
+        self.assertEqual(CompletionDisplayMode.GHOST, display.mode)
+        self.assertEqual("en3-embedding:8b", display.ghost_text)
+        self.assertEqual(["qwen3-embedding:8b"], [candidate.text for candidate in display.candidates])
+
+    def test_classify_shell_completion_uses_menu_for_ambiguous_embed_model_match(self) -> None:
+        controller = FakeController()
+
+        display = classify_shell_completion("embed ", controller.list_installed())
+
+        self.assertEqual(CompletionDisplayMode.MENU, display.mode)
+        self.assertEqual("", display.ghost_text)
+        self.assertEqual(["llama3.2", "qwen3-embedding:8b"], [candidate.text for candidate in display.candidates])
+
     def test_complete_shell_input_stops_model_completion_after_embed_model(self) -> None:
         controller = FakeController()
 
         candidates = complete_shell_input("embed qwen3-embedding:8b text", controller.list_installed())
 
         self.assertEqual((), candidates)
+
+    def test_classify_shell_completion_stops_after_embed_model_argument(self) -> None:
+        controller = FakeController()
+
+        display = classify_shell_completion("embed qwen3-embedding:8b text", controller.list_installed())
+
+        self.assertEqual(CompletionDisplayMode.NONE, display.mode)
+        self.assertEqual("", display.ghost_text)
+        self.assertEqual([], list(display.candidates))
 
     def test_format_install_pane_is_ascii(self) -> None:
         pane = format_install_pane("llama3.2", 0.82, ["downloading layers", "1.8 GB / 2.2 GB"])
