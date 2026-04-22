@@ -11,6 +11,7 @@ from runic import DefaultError, Err, Ok, Result, Runic
 from .controller import ModelController
 from .models import ChatMessage
 from .registry import ModelRegistry, default_registry_path
+from .runners.base import RunnerChatError
 from .runners.ollama import OllamaRunner
 
 
@@ -104,12 +105,22 @@ async def _stream_chat(controller: ModelController, model: str, prompt: str, con
     console.print()
 
 
+def _format_error(error: DefaultError) -> str:
+    code = error.code or "error"
+    message = f"{code}: {error.message}"
+    if isinstance(error.details, dict):
+        detail = error.details.get("error")
+        if isinstance(detail, str) and detail:
+            return f"{message} {detail}"
+    return message
+
+
 def _print_install_result(result: Result[str, DefaultError], console: _Console) -> None:
     match result:
         case Ok(value=spell_id):
             console.print(f"Installation scheduled: {spell_id}")
         case Err(error=error):
-            console.print(f"{error.code}: {error.message}")
+            console.print(_format_error(error))
 
 
 def _print_install_completion(result: Result[object, DefaultError], console: _Console) -> None:
@@ -117,7 +128,7 @@ def _print_install_completion(result: Result[object, DefaultError], console: _Co
         case Ok():
             console.print("Installation completed")
         case Err(error=error):
-            console.print(f"{error.code}: {error.message}")
+            console.print(_format_error(error))
 
 
 async def _install_and_wait(controller: ModelController, source: str, console: _Console) -> None:
@@ -184,5 +195,7 @@ def run_interactive(
                         asyncio.run(_stream_chat(active_controller, command.argument, chat_prompt, active_console))
                     except LookupError as exc:
                         active_console.print(str(exc))
+                    except RunnerChatError as exc:
+                        active_console.print(_format_error(exc.error))
             case ShellCommand.UNKNOWN:
                 active_console.print(f"Unknown command: {line.strip()}")

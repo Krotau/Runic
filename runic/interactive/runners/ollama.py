@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
@@ -82,6 +83,24 @@ def _chat_content_from_response(response: object) -> str:
     return content
 
 
+def _http_error_details(exc: urllib.error.HTTPError) -> object:
+    try:
+        raw = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        raw = ""
+
+    if raw.strip():
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"status": exc.code, "reason": exc.msg, "body": raw}
+        if isinstance(decoded, dict):
+            return decoded
+        return {"status": exc.code, "reason": exc.msg, "response": decoded}
+
+    return {"status": exc.code, "reason": exc.msg}
+
+
 async def _default_http_chat(url: str, payload: dict[str, object]) -> dict[str, object]:
     def _post_json() -> dict[str, object]:
         data = json.dumps(payload).encode("utf-8")
@@ -130,6 +149,8 @@ async def _default_chat_client(
         content = _chat_content_from_response(response)
     except RunnerChatError:
         raise
+    except urllib.error.HTTPError as exc:
+        raise _chat_failure("Failed to chat with Ollama.", details=_http_error_details(exc)) from exc
     except Exception as exc:
         raise _chat_failure(
             "Failed to chat with Ollama.",

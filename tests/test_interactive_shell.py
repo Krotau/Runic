@@ -11,11 +11,11 @@ from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
-from runic import Err, Ok, Runic
+from runic import DefaultError, Err, Ok, Runic
 from runic.interactive.controller import ModelController
 from runic.interactive.models import ChatMessage, InstalledModel, ModelInstallStatus, ModelProvider
 from runic.interactive.registry import ModelRegistry
-from runic.interactive.runners.base import RunnerCapability
+from runic.interactive.runners.base import RunnerCapability, RunnerChatError
 import runic.cli as cli
 import runic.interactive.shell as shell
 from runic.interactive.shell import ParsedCommand, ShellCommand, format_install_pane, parse_shell_command
@@ -55,6 +55,20 @@ class FakeController:
         self.chat_calls.append((model, messages))
         for chunk in self.chat_chunks:
             yield chunk
+
+
+class FailingChatController(FakeController):
+    async def chat(self, model: str, messages: tuple[ChatMessage, ...]):
+        self.chat_calls.append((model, messages))
+        raise RunnerChatError(
+            DefaultError(
+                message="Failed to chat with Ollama.",
+                code="runner_chat_failed",
+                details={"error": "qwen3-embedding:8b does not support chat"},
+            )
+        )
+        if False:
+            yield ""
 
 
 class CompletingRunner:
@@ -170,6 +184,21 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertEqual("llama3.2", controller.chat_calls[0][0])
         self.assertEqual((ChatMessage(role="user", content="Tell me more"),), controller.chat_calls[0][1])
         self.assertIn("hello world", console.text())
+
+    def test_run_command_prints_runner_chat_errors_without_crashing(self) -> None:
+        controller = FailingChatController()
+        console = FakeConsole()
+
+        result = shell.run_interactive(
+            controller=controller,
+            prompt_fn=make_prompt_fn(["run qwen3-embedding:8b", "exit"], ["Embed this"]),
+            console=console,
+        )
+
+        self.assertEqual(0, result)
+        self.assertEqual(1, len(controller.chat_calls))
+        self.assertIn("runner_chat_failed: Failed to chat with Ollama.", console.text())
+        self.assertIn("qwen3-embedding:8b does not support chat", console.text())
 
     def test_run_exit_leaves_chat_without_controller_call(self) -> None:
         controller = FakeController(chat_chunks=("should-not-print",))

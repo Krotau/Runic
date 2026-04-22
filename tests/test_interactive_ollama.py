@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import unittest
+import urllib.error
 from collections.abc import AsyncIterator
 
 from runic import DefaultError, Err, Ok
@@ -138,6 +140,24 @@ class TestInteractiveOllamaRunner(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("runner_chat_failed", cm.exception.error.code)
         self.assertEqual({"model": "llama3.2", "error": "boom"}, cm.exception.error.details)
+
+    async def test_default_chat_preserves_ollama_http_error_body(self) -> None:
+        async def chat_http(_: str, __: dict[str, object]) -> dict[str, object]:
+            raise urllib.error.HTTPError(
+                "http://127.0.0.1:11434/api/chat",
+                400,
+                "Bad Request",
+                {},
+                io.BytesIO(b'{"error":"qwen3-embedding:8b does not support chat"}'),
+            )
+
+        runner = OllamaRunner(command_exists=lambda _: True, chat_http=chat_http)
+
+        with self.assertRaises(RunnerChatError) as cm:
+            await collect(runner.chat("qwen3-embedding:8b", (ChatMessage(role="user", content="hi"),)))
+
+        self.assertEqual("runner_chat_failed", cm.exception.error.code)
+        self.assertEqual({"error": "qwen3-embedding:8b does not support chat"}, cm.exception.error.details)
 
     async def test_default_chat_raises_for_error_payloads(self) -> None:
         async def chat_http(_: str, __: dict[str, object]) -> dict[str, object]:
