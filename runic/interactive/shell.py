@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
@@ -62,6 +62,72 @@ class ShellFrame:
     pane: PaneState | None = None
     width: int = 80
     height: int = 18
+
+
+@dataclass(slots=True)
+class TuiShellState:
+    output: list[str] = field(default_factory=lambda: ["Runic interactive shell"])
+    pane: PaneState | None = None
+    status: str = "runner: ollama ready"
+    prompt: str = "runic> "
+    pane_position: str = "right"
+    pane_visible: bool = False
+    chat_model: str | None = None
+
+    def append(self, line: str) -> None:
+        self.output.append(line)
+
+    def set_pane(self, pane: PaneState | None) -> None:
+        self.pane = pane
+        self.pane_visible = pane is not None
+
+    def hide_pane(self) -> None:
+        self.pane_visible = False
+
+    def cycle_pane_position(self) -> None:
+        match self.pane_position:
+            case "right":
+                self.pane_position = "top"
+            case "top":
+                self.pane_position = "right"
+            case _:
+                self.pane_position = "right"
+
+    def enter_chat(self, model: str) -> None:
+        self.chat_model = model
+        self.status = f"model: {model}"
+        self.prompt = f"chat:{model}> "
+        self.set_pane(
+            PaneState(
+                title="Session",
+                lines=(
+                    f"model {model}",
+                    "runner ollama",
+                    "temp default",
+                    "",
+                    "Future Context",
+                    "MCP disabled",
+                    "RAG disabled",
+                ),
+                footer=("Tab: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
+            )
+        )
+
+    def exit_chat(self) -> None:
+        self.chat_model = None
+        self.status = "runner: ollama ready"
+        self.prompt = "runic> "
+
+    def output_text(self) -> str:
+        return "\n".join(self.output)
+
+    def pane_text(self) -> str:
+        if self.pane is None:
+            return ""
+        lines = [self.pane.title, *self.pane.lines]
+        if self.pane.footer:
+            lines.extend(["", *self.pane.footer])
+        return "\n".join(str(line) for line in lines)
 
 
 COMMAND_COMPLETIONS = ("install", "chat", "embed", "help", "exit")
@@ -292,6 +358,310 @@ def _default_controller() -> ModelController:
     return ModelController(runtime, registry, (OllamaRunner(),))
 
 
+def _run_tui_application(controller: ModelController) -> int:
+    try:
+        from prompt_toolkit.application import Application
+        from prompt_toolkit.application.current import get_app
+        from prompt_toolkit.completion import Completer, Completion
+        from prompt_toolkit.formatted_text import FormattedText
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import Layout
+        from prompt_toolkit.layout.containers import ConditionalContainer, HSplit, VSplit, Window
+        from prompt_toolkit.layout.controls import FormattedTextControl
+        from prompt_toolkit.layout.dimension import Dimension
+        from prompt_toolkit.shortcuts.prompt import CompleteStyle
+        from prompt_toolkit.filters import Condition
+        from prompt_toolkit.widgets import Frame, TextArea
+    except ImportError:
+        print(_cli_extras_message())
+        return 1
+
+    state = TuiShellState()
+    output_area = TextArea(
+        text=state.output_text(),
+        read_only=True,
+        focusable=True,
+        scrollbar=True,
+        wrap_lines=True,
+    )
+    pane_area = TextArea(
+        text=state.pane_text(),
+        read_only=True,
+        focusable=True,
+        scrollbar=True,
+        wrap_lines=True,
+    )
+
+    class RunicCompleter(Completer):
+        def get_completions(self, document, complete_event):  # type: ignore[no-untyped-def]
+            if state.chat_model is not None:
+                return
+            for candidate in complete_shell_input(document.text_before_cursor, controller.list_installed()):
+                yield Completion(
+                    candidate.text,
+                    start_position=candidate.start_position,
+                    display_meta=candidate.display_meta,
+                )
+
+    command_area = TextArea(
+        height=1,
+        multiline=False,
+        completer=RunicCompleter(),
+        complete_while_typing=True,
+        focusable=True,
+        wrap_lines=False,
+    )
+    key_bindings = KeyBindings()
+
+    def refresh() -> None:
+        output_area.text = state.output_text()
+        pane_area.text = state.pane_text()
+        get_app().invalidate()
+
+    def set_install_pane(model: str, progress: str, *lines: str) -> None:
+        state.set_pane(
+            PaneState(
+                title="Install",
+                lines=(model, progress, *lines),
+                footer=("Tab: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
+            )
+        )
+
+    async def handle_chat_message(text: str) -> None:
+        model = state.chat_model
+        if model is None:
+            return
+        if text.strip() == "/exit":
+            state.exit_chat()
+            state.append("Exited chat.")
+            refresh()
+            return
+
+        state.append(f"You: {text}")
+        refresh()
+        try:
+            response = ""
+            async for chunk in controller.chat(model, (ChatMessage(role="user", content=text),)):
+                response += chunk
+                if response:
+                    output_area.text = f"{state.output_text()}\nAssistant: {response}"
+                    get_app().invalidate()
+            state.append(f"Assistant: {response}")
+        except LookupError as exc:
+            state.append(str(exc))
+        except RunnerChatError as exc:
+            state.append(_format_error(exc.error))
+        refresh()
+
+    async def handle_command(text: str) -> None:
+        command = parse_shell_command(text)
+        match command.command:
+            case ShellCommand.EXIT:
+                get_app().exit(result=0)
+            case ShellCommand.HELP:
+                state.append("Commands: install <model>, chat <model>, embed <model> <text-or-file-path>, help, exit")
+                refresh()
+            case ShellCommand.UNKNOWN:
+                state.append(f"Unknown command: {text.strip()}")
+                refresh()
+            case ShellCommand.INSTALL:
+                if command.argument is None:
+                    state.append("Model selection is not implemented yet. Use install <model>.")
+                    refresh()
+                    return
+                state.append(f"> install {command.argument}")
+                state.append("Resolving model reference...")
+                set_install_pane(command.argument, "starting", "waiting for runner")
+                refresh()
+                result = await controller.install(command.argument)
+                match result:
+                    case Err(error=error):
+                        state.append(_format_error(error))
+                        set_install_pane(command.argument, "failed", _format_error(error))
+                    case Ok(value=spell_id):
+                        state.append(f"Installation scheduled: {spell_id}")
+                        set_install_pane(command.argument, "running", f"spell {spell_id}")
+                        refresh()
+                        settled = await controller.wait_for_install(spell_id)
+                        match settled:
+                            case Ok():
+                                state.append("Installation completed")
+                                set_install_pane(command.argument, "############# 100%", "Installation completed")
+                            case Err(error=error):
+                                state.append(_format_error(error))
+                                set_install_pane(command.argument, "failed", _format_error(error))
+                refresh()
+            case ShellCommand.CHAT:
+                if command.argument is None:
+                    state.append("Use chat <model>.")
+                else:
+                    state.append(f"> chat {command.argument}")
+                    state.enter_chat(command.argument)
+                refresh()
+            case ShellCommand.EMBED:
+                split = _split_model_and_value(command.argument, "embed")
+                match split:
+                    case Err(error=error):
+                        state.append(_format_error(error))
+                    case Ok(value=(model, value)):
+                        embed_input = _read_embed_input(value)
+                        match embed_input:
+                            case Err(error=error):
+                                state.append(_format_error(error))
+                            case Ok(value=text_value):
+                                state.append(f"> embed {model} {value}")
+                                state.set_pane(
+                                    PaneState(
+                                        title="Session",
+                                        lines=(f"model {model}", "runner ollama", "embedding mode"),
+                                        footer=("Tab: focus pane", "Esc: hide pane", "Ctrl-P: move pane"),
+                                    )
+                                )
+                                refresh()
+                                result = await controller.embed(model, text_value)
+                                match result:
+                                    case Ok(value=embedding):
+                                        state.append(f"Embedding dimensions: {len(embedding)}")
+                                        state.append(f"Embedding preview: {_format_embedding_preview(embedding)}")
+                                    case Err(error=error):
+                                        state.append(_format_error(error))
+                refresh()
+
+    async def accept_input() -> None:
+        text = command_area.text
+        command_area.text = ""
+        if not text.strip():
+            refresh()
+            return
+        if state.chat_model is not None:
+            await handle_chat_message(text)
+        else:
+            await handle_command(text)
+
+    @Condition
+    def completion_menu_visible() -> bool:
+        return bool(command_area.buffer.complete_state)
+
+    @Condition
+    def input_focused() -> bool:
+        return get_app().layout.current_window is command_area.window
+
+    @Condition
+    def pane_focused() -> bool:
+        return get_app().layout.current_window is pane_area.window
+
+    @Condition
+    def pane_visible() -> bool:
+        return state.pane is not None and state.pane_visible
+
+    @Condition
+    def pane_right() -> bool:
+        return state.pane_position == "right"
+
+    @Condition
+    def pane_top() -> bool:
+        return state.pane_position == "top"
+
+    @key_bindings.add("enter", filter=completion_menu_visible & input_focused)
+    def _(event):  # type: ignore[no-untyped-def]
+        completion = command_area.buffer.complete_state.current_completion
+        if completion is not None:
+            command_area.buffer.apply_completion(completion)
+
+    @key_bindings.add("enter", filter=input_focused & ~completion_menu_visible)
+    def _(event):  # type: ignore[no-untyped-def]
+        event.app.create_background_task(accept_input())
+
+    @key_bindings.add("enter", filter=pane_focused)
+    def _(event):  # type: ignore[no-untyped-def]
+        if state.pane is not None:
+            state.append(f"Pane details: {state.pane.title}")
+            refresh()
+
+    @key_bindings.add("tab")
+    def _(event):  # type: ignore[no-untyped-def]
+        focus_order = [command_area, output_area]
+        if state.pane is not None and state.pane_visible:
+            focus_order.append(pane_area)
+        current = event.app.layout.current_window
+        current_index = 0
+        for index, area in enumerate(focus_order):
+            if current is area.window:
+                current_index = index
+                break
+        event.app.layout.focus(focus_order[(current_index + 1) % len(focus_order)])
+
+    @key_bindings.add("s-tab")
+    def _(event):  # type: ignore[no-untyped-def]
+        focus_order = [command_area, output_area]
+        if state.pane is not None and state.pane_visible:
+            focus_order.append(pane_area)
+        current = event.app.layout.current_window
+        current_index = 0
+        for index, area in enumerate(focus_order):
+            if current is area.window:
+                current_index = index
+                break
+        event.app.layout.focus(focus_order[(current_index - 1) % len(focus_order)])
+
+    @key_bindings.add("escape", filter=pane_visible)
+    def _(event):  # type: ignore[no-untyped-def]
+        state.hide_pane()
+        refresh()
+
+    @key_bindings.add("c-p", filter=pane_visible)
+    def _(event):  # type: ignore[no-untyped-def]
+        state.cycle_pane_position()
+        refresh()
+
+    @key_bindings.add("c-c")
+    @key_bindings.add("c-q")
+    def _(event):  # type: ignore[no-untyped-def]
+        event.app.exit(result=0)
+
+    def header_text():
+        return FormattedText([("class:header", _frame_line("Runic Interactive", state.status, 78))])
+
+    def prompt_text():
+        return FormattedText([("class:prompt", state.prompt)])
+
+    header = Window(FormattedTextControl(header_text), height=1)
+    prompt_label = Window(FormattedTextControl(prompt_text), width=Dimension(min=8, max=32))
+    input_row = VSplit([prompt_label, command_area])
+    right_body = VSplit(
+        [
+            Frame(output_area, title="Output"),
+            ConditionalContainer(Frame(pane_area, title="Pane"), filter=pane_visible & pane_right),
+        ]
+    )
+    top_body = HSplit(
+        [
+            ConditionalContainer(Frame(pane_area, title="Pane"), filter=pane_visible & pane_top),
+            Frame(output_area, title="Output"),
+        ]
+    )
+    root = HSplit(
+        [
+            header,
+            ConditionalContainer(right_body, filter=~pane_top),
+            ConditionalContainer(top_body, filter=pane_top),
+            input_row,
+        ]
+    )
+    app = Application(
+        layout=Layout(root, focused_element=command_area),
+        key_bindings=key_bindings,
+        full_screen=True,
+        mouse_support=True,
+        refresh_interval=0.25,
+    )
+    try:
+        result = app.run()
+    except (EOFError, KeyboardInterrupt):
+        return 0
+    return int(result or 0)
+
+
 async def _stream_chat(controller: ModelController, model: str, prompt: str, console: _Console) -> str:
     response = ""
     async for chunk in controller.chat(model, (ChatMessage(role="user", content=prompt),)):
@@ -430,6 +800,9 @@ def run_interactive(
     console: _Console | None = None,
 ) -> int:
     active_controller = controller or _default_controller()
+
+    if prompt_fn is None and console is None:
+        return _run_tui_application(active_controller)
 
     try:
         active_prompt_fn = prompt_fn or _load_prompt_fn(active_controller)

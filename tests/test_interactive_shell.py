@@ -23,6 +23,7 @@ from runic.interactive.shell import (
     ParsedCommand,
     ShellCommand,
     ShellFrame,
+    TuiShellState,
     complete_shell_input,
     format_install_pane,
     parse_shell_command,
@@ -277,6 +278,21 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertIn("Future Context", frame)
         self.assertIn("chat:llama3.2> _", frame)
 
+    def test_tui_shell_state_tracks_focusable_pane_state(self) -> None:
+        state = TuiShellState()
+
+        state.enter_chat("llama3.2")
+        self.assertEqual("chat:llama3.2> ", state.prompt)
+        self.assertTrue(state.pane_visible)
+        self.assertIn("Session", state.pane_text())
+        self.assertIn("model llama3.2", state.pane_text())
+
+        state.hide_pane()
+        self.assertFalse(state.pane_visible)
+
+        state.cycle_pane_position()
+        self.assertEqual("top", state.pane_position)
+
     def test_install_command_schedules_through_controller(self) -> None:
         controller = FakeController(install_result=Ok("spell-123"))
         console = FakeConsole()
@@ -407,12 +423,20 @@ class TestInteractiveShell(unittest.TestCase):
         controller = FakeController()
         output = io.StringIO()
 
-        with patch.object(shell, "_load_prompt_fn", side_effect=ImportError):
+        with patch.object(shell, "_run_tui_application", side_effect=lambda _: print(shell._cli_extras_message()) or 1):
             with contextlib.redirect_stdout(output):
                 result = shell.run_interactive(controller=controller)
 
         self.assertEqual(1, result)
         self.assertIn('runic-io[cli]', output.getvalue())
+
+    def test_default_interactive_path_uses_tui_application(self) -> None:
+        controller = FakeController()
+
+        with patch.object(shell, "_run_tui_application", return_value=5) as run_tui:
+            self.assertEqual(5, shell.run_interactive(controller=controller))
+
+        run_tui.assert_called_once_with(controller)
 
     def test_cli_main_delegates_lazily(self) -> None:
         with patch.object(shell, "run_interactive", return_value=7) as run_interactive:
