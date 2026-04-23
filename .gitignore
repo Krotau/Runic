@@ -37,6 +37,8 @@ htmlcov/
 .local/update_dist.sh
 .local/publish_pypi.sh
 .worktrees/
+.superpowers/
+docs/
 
 # Editors / OS noise
 .idea/
