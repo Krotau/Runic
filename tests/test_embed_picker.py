@@ -19,7 +19,7 @@ class TestEmbedPicker(unittest.TestCase):
         self.assertEqual("1.5 KB", format_file_size(1536))
         self.assertEqual("2.0 MB", format_file_size(2 * 1024 * 1024))
 
-    def test_list_entries_sorts_directories_before_files_and_adds_metadata(self) -> None:
+    def test_list_entries_sorts_mixed_case_names_after_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir)
             (root / "Zoo").mkdir()
@@ -40,6 +40,31 @@ class TestEmbedPicker(unittest.TestCase):
         self.assertTrue(entries[2].selected)
         self.assertTrue(entries[2].hovered)
         self.assertEqual(".txt", entries[3].type_label)
+
+    def test_list_entries_adds_requested_metadata_for_readme_and_main(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            (root / "src").mkdir()
+            (root / "README.md").write_text("hello", encoding="utf-8")
+            (root / "main.py").write_text("print('hi')", encoding="utf-8")
+
+            entries = list_embed_picker_entries(
+                root,
+                selected_paths={(root / "README.md").resolve()},
+                cursor_index=2,
+            )
+
+        self.assertEqual(["src", "main.py", "README.md"], [entry.name for entry in entries])
+
+        entries_by_name = {entry.name: entry for entry in entries}
+        self.assertTrue(entries_by_name["src"].is_dir)
+        self.assertEqual("[dir]", entries_by_name["src"].type_label)
+        self.assertEqual("directory", entries_by_name["src"].size_label)
+        self.assertEqual(".md", entries_by_name["README.md"].type_label)
+        self.assertEqual("5 B", entries_by_name["README.md"].size_label)
+        self.assertTrue(entries_by_name["README.md"].selected)
+        self.assertTrue(entries_by_name["README.md"].hovered)
+        self.assertEqual(".py", entries_by_name["main.py"].type_label)
 
     def test_picker_state_starts_at_root_and_loads_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
