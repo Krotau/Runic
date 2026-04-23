@@ -282,6 +282,29 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertIn("82%", pane)
         self.assertTrue(all(ord(character) < 128 for character in pane))
 
+    def test_render_startup_splash_contains_large_special_character_runic_banner(self) -> None:
+        splash = shell.render_startup_splash()
+
+        self.assertIn("RUNIC", splash)
+        self.assertNotIn("\x1b[", splash)
+        self.assertNotIn("[38;5;", splash)
+        self.assertTrue(any(character in splash for character in "█╗╔║╝╚═"))
+
+    def test_render_colored_startup_splash_uses_blue_rich_style(self) -> None:
+        splash = shell.render_colored_startup_splash()
+
+        self.assertEqual(shell.render_startup_splash(), splash.plain)
+        self.assertEqual("bold blue", str(splash.style))
+
+    def test_show_startup_splash_prints_banner_and_waits_one_second(self) -> None:
+        console = FakeConsole()
+        waits: list[float] = []
+
+        shell.show_startup_splash(console, sleep_fn=waits.append)
+
+        self.assertIn("RUNIC", console.text())
+        self.assertEqual([1.0], waits)
+
     def test_render_shell_frame_draws_install_side_pane(self) -> None:
         frame = render_shell_frame(
             ShellFrame(
@@ -470,6 +493,21 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertIn("runner_chat_failed: Failed to chat with Ollama.", console.text())
         self.assertIn("qwen3-embedding:8b does not support chat", console.text())
 
+    def test_format_error_includes_runner_command_stderr(self) -> None:
+        error = DefaultError(
+            message="Runner command failed.",
+            code="runner_command_failed",
+            details={
+                "command": ["ollama", "pull", "gemma4:e4"],
+                "stderr": "pull model manifest: file does not exist",
+            },
+        )
+
+        message = shell._format_error(error)
+
+        self.assertIn("runner_command_failed: Runner command failed.", message)
+        self.assertIn("pull model manifest: file does not exist", message)
+
     def test_chat_exit_leaves_chat_without_controller_call(self) -> None:
         controller = FakeController(chat_chunks=("should-not-print",))
         console = FakeConsole()
@@ -520,16 +558,29 @@ class TestInteractiveShell(unittest.TestCase):
 
         with patch.object(shell, "_run_tui_application", side_effect=lambda _: print(shell._cli_extras_message()) or 1):
             with contextlib.redirect_stdout(output):
-                result = shell.run_interactive(controller=controller)
+                result = shell.run_interactive(controller=controller, startup_delay=0)
 
         self.assertEqual(1, result)
         self.assertIn('runic-io[cli]', output.getvalue())
 
     def test_default_interactive_path_uses_tui_application(self) -> None:
         controller = FakeController()
+        console = FakeConsole()
+
+        with patch.object(shell, "_load_console", return_value=console):
+            with patch.object(shell, "time_sleep") as sleep:
+                with patch.object(shell, "_run_tui_application", return_value=5) as run_tui:
+                    self.assertEqual(5, shell.run_interactive(controller=controller))
+
+        self.assertIn("RUNIC", console.text())
+        sleep.assert_called_once_with(1.0)
+        run_tui.assert_called_once_with(controller)
+
+    def test_default_interactive_path_can_skip_startup_delay(self) -> None:
+        controller = FakeController()
 
         with patch.object(shell, "_run_tui_application", return_value=5) as run_tui:
-            self.assertEqual(5, shell.run_interactive(controller=controller))
+            self.assertEqual(5, shell.run_interactive(controller=controller, startup_delay=0))
 
         run_tui.assert_called_once_with(controller)
 

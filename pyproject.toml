@@ -31,9 +31,9 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/Krotau/Wyvern"
-Repository = "https://github.com/Krotau/Wyvern"
-Issues = "https://github.com/Krotau/Wyvern/issues"
+Homepage = "https://github.com/Krotau/Runic"
+Repository = "https://github.com/Krotau/Runic"
+Issues = "https://github.com/Krotau/Runic/issues"
 
 [project.optional-dependencies]
 cli = ["prompt_toolkit>=3", "rich>=13"]

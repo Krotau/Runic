@@ -74,6 +74,8 @@ class SpellRecord:
     logs: list[str] = field(default_factory=list)
     result: Any | None = None
     error: str | None = None
+    error_code: str | None = None
+    error_details: Any | None = None
     attempt: int = 0
     max_attempts: int = 1
     idempotency_key: str | None = None
@@ -125,6 +127,15 @@ def _error_message(error: object) -> str:
             return text
         case _:
             return str(error)
+
+
+def _error_code(error: object) -> str | None:
+    code = getattr(error, "code", None)
+    return code if isinstance(code, str) else None
+
+
+def _error_details(error: object) -> Any | None:
+    return getattr(error, "details", None)
 
 
 def _result_payload(value: object) -> Any | None:
@@ -233,7 +244,13 @@ class Conduit(Generic[TEvent]):
                     case SpellStatus.SUCCEEDED:
                         return Ok(record.result)
                     case SpellStatus.FAILED:
-                        return Err(DefaultError(message=record.error or "Spell failed", code="spell_failed"))
+                        return Err(
+                            DefaultError(
+                                message=record.error or "Spell failed",
+                                code=record.error_code or "spell_failed",
+                                details=record.error_details,
+                            )
+                        )
                     case SpellStatus.CANCELLED:
                         return Err(DefaultError(message=f"Spell cancelled: {spell_id}", code="spell_cancelled"))
                     case SpellStatus.PENDING | SpellStatus.RUNNING:
@@ -419,6 +436,8 @@ class Conduit(Generic[TEvent]):
                     record.progress = 0.0
                     record.result = None
                     record.error = None
+                    record.error_code = None
+                    record.error_details = None
                     ctx.attempt = record.attempt
                     ctx.max_attempts = record.max_attempts
                     await publish_status()
@@ -429,6 +448,8 @@ class Conduit(Generic[TEvent]):
                         raise
                     except Exception as exc:
                         record.error = str(exc)
+                        record.error_code = None
+                        record.error_details = None
                         if not (retry_policy.retry_on_exception and record.attempt < retry_policy.max_attempts):
                             record.status = SpellStatus.FAILED
                             await publish_status()
@@ -443,6 +464,8 @@ class Conduit(Generic[TEvent]):
                         match result:
                             case Err(error=error):
                                 record.error = _error_message(error)
+                                record.error_code = _error_code(error)
+                                record.error_details = _error_details(error)
                                 record.result = None
                                 if not (retry_policy.retry_on_err and record.attempt < retry_policy.max_attempts):
                                     record.status = SpellStatus.FAILED

@@ -6,6 +6,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from time import sleep as time_sleep
 from typing import Protocol
 
 from runic import DefaultError, Err, Ok, Result, Runic
@@ -272,6 +273,41 @@ def format_install_pane(model: str, progress: float, lines: Sequence[str]) -> st
 
 def _cli_extras_message() -> str:
     return 'Optional CLI extras are not installed. Install "runic-io[cli]" to use the interactive shell.'
+
+
+def render_startup_splash() -> str:
+    return "\n".join(
+        (
+            "██████╗ ██╗   ██╗███╗   ██╗██╗ ██████╗",
+            "██╔══██╗██║   ██║████╗  ██║██║██╔════╝",
+            "██████╔╝██║   ██║██╔██╗ ██║██║██║     ",
+            "██╔══██╗██║   ██║██║╚██╗██║██║██║     ",
+            "██║  ██║╚██████╔╝██║ ╚████║██║╚██████╗",
+            "╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝ ╚═════╝",
+            "RUNIC",
+        )
+    )
+
+
+def render_colored_startup_splash() -> object:
+    from rich.text import Text
+
+    return Text(render_startup_splash(), style="bold blue")
+
+
+def show_startup_splash(
+    console: _Console,
+    *,
+    sleep_fn: Callable[[float], None] | None = None,
+    delay_seconds: float = 1.0,
+) -> None:
+    try:
+        splash: object = render_colored_startup_splash()
+    except ImportError:
+        splash = render_startup_splash()
+    console.print(splash)
+    if delay_seconds > 0:
+        (sleep_fn or time_sleep)(delay_seconds)
 
 
 def complete_shell_input(text_before_cursor: str, installed_models: Sequence[object]) -> tuple[ShellCompletion, ...]:
@@ -765,10 +801,25 @@ def _format_error(error: DefaultError) -> str:
     code = error.code or "error"
     message = f"{code}: {error.message}"
     if isinstance(error.details, dict):
-        detail = error.details.get("error")
-        if isinstance(detail, str) and detail:
+        detail = _format_error_detail(error.details)
+        if detail:
             return f"{message} {detail}"
     return message
+
+
+def _format_error_detail(details: dict[object, object]) -> str:
+    for key in ("error", "stderr"):
+        detail = details.get(key)
+        if isinstance(detail, str) and detail.strip():
+            return " ".join(detail.split())
+
+    stdout = details.get("stdout")
+    if isinstance(stdout, list):
+        lines = [str(line).strip() for line in stdout if str(line).strip()]
+        if lines:
+            return " ".join(lines)
+
+    return ""
 
 
 def _split_model_and_value(argument: str | None, command: str) -> Result[tuple[str, str], DefaultError]:
@@ -888,10 +939,21 @@ def run_interactive(
     controller: ModelController | None = None,
     prompt_fn: PromptFn | None = None,
     console: _Console | None = None,
+    startup_delay: float | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
 ) -> int:
     active_controller = controller or _default_controller()
 
     if prompt_fn is None and console is None:
+        delay_seconds = 1.0 if startup_delay is None else startup_delay
+        try:
+            splash_console = _load_console()
+        except ImportError:
+            print(render_startup_splash())
+            if delay_seconds > 0:
+                (sleep_fn or time_sleep)(delay_seconds)
+        else:
+            show_startup_splash(splash_console, sleep_fn=sleep_fn, delay_seconds=delay_seconds)
         return _run_tui_application(active_controller)
 
     try:
@@ -905,6 +967,9 @@ def run_interactive(
     except ImportError:
         print(_cli_extras_message())
         return 1
+
+    delay_seconds = 0.0 if startup_delay is None else startup_delay
+    show_startup_splash(active_console, sleep_fn=sleep_fn, delay_seconds=delay_seconds)
 
     output_lines: list[str] = ["Runic interactive shell"]
     active_pane: PaneState | None = None

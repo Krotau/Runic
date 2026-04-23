@@ -1,0 +1,62 @@
+<h2>Embed File Picker Pane</h2>
+<p class="subtitle">Two possible layouts for the focused pane that opens after <code>embed &lt;model&gt;</code>.</p>
+
+<div class="split">
+  <div class="mockup" data-choice="compact-tree" onclick="toggleSelect(this)">
+    <div class="mockup-header">A. Compact Tree Pane</div>
+    <div class="mockup-body">
+      <pre style="font-size:13px;line-height:1.35;margin:0">
+Runic Interactive                         runner: ollama ready
++ Command ---------------------------------------------------+
+| runic> embed qwen3-embedding:8b                           |
++ Output ---------------------------+ Pane ------------------+
+| Runic interactive shell           | Embed Files            |
+|                                   | Pick files to parse    |
+|                                   | cwd /home/arc/Wyvern   |
+|                                   |                        |
+|                                   | > [ ] [dir] runic/     |
+|                                   |   [ ] [dir] tests/     |
+|                                   |   [ ] .py  main.py 1KB |
+|                                   |   [x] .md  README 4KB  |
+|                                   |                        |
+|                                   | Space select           |
+|                                   | Tab enter dir          |
+|                                   | Enter embed selected   |
++------------------------------------------------------------+
+Tab dir | Space select | Enter embed | Backspace up | Esc cancel
+      </pre>
+    </div>
+    <div class="card-body">
+      <h3>Compact Tree Pane</h3>
+      <p>Fits the existing right/top pane model with minimal layout changes. Best for consistency and lower implementation risk.</p>
+    </div>
+  </div>
+
+  <div class="mockup" data-choice="wide-picker" onclick="toggleSelect(this)">
+    <div class="mockup-header">B. Wide Picker Mode</div>
+    <div class="mockup-body">
+      <pre style="font-size:13px;line-height:1.35;margin:0">
+Runic Interactive                         runner: ollama ready
++ Embed Files: qwen3-embedding:8b ---------------------------+
+| Pick files to parse. Space multi-select, Tab enters dirs.  |
+| cwd /home/arc/Wyvern                                      |
+|                                                           |
+| > [ ] [dir] runic/                         directory      |
+|   [ ] [dir] tests/                         directory      |
+|   [ ] [dir] docs/                          directory      |
+|   [ ] .py    main.py                       1.2 KB         |
+|   [x] .md    README.md                     4.1 KB         |
+|   [ ] .csv   data/fake.csv                 824 B          |
+|                                                           |
+| Selected: 1 file, 4.1 KB                                  |
++ Output ----------------------------------------------------+
+| After Enter, embeddings progress and preview appear here.  |
++-----------------------------------------------------------+
+      </pre>
+    </div>
+    <div class="card-body">
+      <h3>Wide Picker Mode</h3>
+      <p>More readable for long names and metadata, but diverges from the current transient pane interaction.</p>
+    </div>
+  </div>
+</div>

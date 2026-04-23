@@ -317,6 +317,24 @@ class TestConduit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("broken", spell_result.error.message)
         self.assertEqual("spell_failed", spell_result.error.code)
 
+    async def test_err_results_preserve_default_error_code_and_details(self) -> None:
+        conduit = Conduit(create_bus(dict))
+        details = {"stderr": "pull model manifest: file does not exist"}
+
+        async def work(ctx):
+            return Err(DefaultError(message="Runner command failed.", code="runner_command_failed", details=details))
+
+        spell_id = await conduit.invoke(work)
+        await asyncio.wait_for(self._wait_for_status(conduit, spell_id, SpellStatus.FAILED), timeout=1.0)
+
+        spell_result = conduit.get_spell_result(spell_id)
+
+        self.assertIsInstance(spell_result, Err)
+        assert isinstance(spell_result, Err)
+        self.assertEqual("Runner command failed.", spell_result.error.message)
+        self.assertEqual("runner_command_failed", spell_result.error.code)
+        self.assertEqual(details, spell_result.error.details)
+
     async def test_failing_spells_record_exception_message_and_clear_future(self) -> None:
         conduit = Conduit(create_bus(dict))
 
