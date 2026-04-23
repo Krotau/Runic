@@ -196,5 +196,5 @@ class TestEmbedPicker(unittest.TestCase):
 
             expanded = expand_selected_paths([skipped_dir])
 
-        self.assertEqual([], expanded.files)
+        self.assertEqual(tuple(), expanded.files)
         self.assertEqual(1, expanded.skipped)

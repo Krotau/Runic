@@ -62,7 +62,7 @@ class EmbedReadableFile:
 
 @dataclass(frozen=True, slots=True)
 class EmbedSelectionExpansion:
-    files: list[EmbedReadableFile]
+    files: tuple[EmbedReadableFile, ...]
     skipped: int = 0
 
 
@@ -279,7 +279,7 @@ def expand_selected_paths(paths: Sequence[Path]) -> EmbedSelectionExpansion:
                 skipped += 1
                 continue
             readable.append(EmbedReadableFile(path=path, text=text))
-    return EmbedSelectionExpansion(files=readable, skipped=skipped)
+    return EmbedSelectionExpansion(files=tuple(readable), skipped=skipped)
 
 
 def list_embed_picker_entries(
