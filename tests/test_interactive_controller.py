@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 from runic import DefaultError, Err, Ok, Runic, SpellStatus
+from runic.interactive.install_status import encode_install_status, InstallPhase, InstallPhaseState, InstallStatusUpdate
 from runic.interactive.controller import InstallDecisionStatus, ModelController
 from runic.interactive.models import ChatMessage, InstalledModel, ModelInstallStatus, ModelProvider, ModelReference
 from runic.interactive.registry import ModelRegistry
@@ -68,6 +69,31 @@ class PendingRunner(FakeRunner):
                 source=reference.source,
                 runner=self.name,
                 status=ModelInstallStatus.PENDING,
+            )
+        )
+
+
+class StructuredLogRunner(FakeRunner):
+    async def install_model(self, reference, context):  # type: ignore[no-untyped-def]
+        await context.log(
+            encode_install_status(
+                InstallStatusUpdate(
+                    phase=InstallPhase.DOWNLOADING,
+                    state=InstallPhaseState.ACTIVE,
+                    detail="pulling manifest",
+                    progress=0.5,
+                )
+            )
+        )
+        await context.log(f"pulling manifest for {reference.model}")
+        await context.progress(1.0)
+        return Ok(
+            InstalledModel(
+                name=reference.local_name,
+                provider=reference.provider,
+                source=reference.source,
+                runner=self.name,
+                status=ModelInstallStatus.INSTALLED,
             )
         )
 
@@ -166,6 +192,51 @@ class TestInteractiveController(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(InstallDecisionStatus.MISSING_RUNNER.value, result.error.code)
             self.assertEqual([], runner.installed)
             self.assertEqual({}, runic.conduit._futures)
+
+    async def test_get_install_record_returns_current_spell_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            registry = ModelRegistry(Path(tempdir) / "models.json")
+            runic = Runic()
+            controller = ModelController(runic, registry, runners=(FakeRunner(),))
+
+            result = await controller.install("llama3.2")
+
+            self.assertIsInstance(result, Ok)
+            assert isinstance(result, Ok)
+            record = controller.get_install_record(result.value)
+
+            self.assertIsInstance(record, Ok)
+            assert isinstance(record, Ok)
+            self.assertIn(record.value.status, {SpellStatus.PENDING, SpellStatus.RUNNING, SpellStatus.SUCCEEDED})
+
+    async def test_install_log_events_yield_spell_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            registry = ModelRegistry(Path(tempdir) / "models.json")
+            runic = Runic()
+            controller = ModelController(runic, registry, runners=(FakeRunner(),))
+            logs = controller.install_log_events()
+
+            result = await controller.install("llama3.2")
+
+            self.assertIsInstance(result, Ok)
+            assert isinstance(result, Ok)
+            event = await anext(logs)
+            await logs.aclose()
+
+            self.assertEqual(result.value, event.data.spell_id)
+            self.assertEqual("installing:llama3.2", event.data.message)
+
+    async def test_install_metadata_ignores_machine_readable_status_logs(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            registry = ModelRegistry(Path(tempdir) / "models.json")
+            controller = ModelController(Runic(), registry, runners=(StructuredLogRunner(),))
+
+            result = await controller.install("llama3.2")
+
+            self.assertIsInstance(result, Ok)
+            assert isinstance(result, Ok)
+            await controller.wait_for_install(result.value)
+            self.assertEqual("pulling manifest for llama3.2", registry.get("llama3.2").metadata["last_log"])
 
     async def test_failed_install_saves_failed_registry_state(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
