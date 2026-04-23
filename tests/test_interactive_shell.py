@@ -569,6 +569,22 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertEqual([], controller.chat_calls)
         self.assertNotIn("should-not-print", console.text())
 
+    def test_split_embed_argument_accepts_model_without_value(self) -> None:
+        split = shell._split_embed_argument("qwen3-embedding:8b")
+
+        self.assertEqual(Ok(("qwen3-embedding:8b", None)), split)
+
+    def test_split_embed_argument_keeps_model_and_text_value(self) -> None:
+        split = shell._split_embed_argument('qwen3-embedding:8b "hello world"')
+
+        self.assertEqual(Ok(("qwen3-embedding:8b", "hello world")), split)
+
+    def test_split_embed_argument_rejects_bare_embed(self) -> None:
+        split = shell._split_embed_argument(None)
+
+        self.assertIsInstance(split, Err)
+        self.assertIn("Use embed <model>", shell._format_error(split.error))
+
     def test_embed_command_embeds_literal_text(self) -> None:
         controller = FakeController()
         console = FakeConsole()

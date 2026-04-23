@@ -865,6 +865,22 @@ def _split_model_and_value(argument: str | None, command: str) -> Result[tuple[s
     return Ok((parts[0], " ".join(parts[1:])))
 
 
+def _split_embed_argument(argument: str | None) -> Result[tuple[str, str | None], DefaultError]:
+    if argument is None:
+        return Err(DefaultError(message="Use embed <model> <text-or-file-path>.", code="invalid_command"))
+
+    try:
+        parts = shlex.split(argument)
+    except ValueError as exc:
+        return Err(DefaultError(message=str(exc), code="invalid_command"))
+
+    if not parts:
+        return Err(DefaultError(message="Use embed <model> <text-or-file-path>.", code="invalid_command"))
+    if len(parts) == 1:
+        return Ok((parts[0], None))
+    return Ok((parts[0], " ".join(parts[1:])))
+
+
 def _read_embed_input(value: str) -> Result[str, DefaultError]:
     path = Path(value).expanduser()
     if not path.is_file():
