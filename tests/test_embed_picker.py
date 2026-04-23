@@ -79,3 +79,47 @@ class TestEmbedPicker(unittest.TestCase):
         self.assertEqual([], sorted(path.name for path in state.selected_paths))
         self.assertEqual(["docs", "README.md"], [entry.name for entry in state.entries])
         self.assertTrue(state.entries[0].hovered)
+
+    def test_picker_moves_cursor_and_toggles_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            (root / "a.txt").write_text("a", encoding="utf-8")
+            (root / "b.txt").write_text("b", encoding="utf-8")
+            state = EmbedPickerState.start(root)
+
+            state.move_down()
+            state.toggle_selection()
+            state.move_up()
+
+        self.assertEqual(0, state.cursor_index)
+        self.assertEqual(["b.txt"], sorted(path.name for path in state.selected_paths))
+        self.assertTrue(state.entries[0].hovered)
+        self.assertTrue(state.entries[1].selected)
+
+    def test_picker_enters_directory_with_tab_and_moves_to_parent_with_backspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            nested = root / "docs"
+            nested.mkdir()
+            (nested / "guide.md").write_text("guide", encoding="utf-8")
+            state = EmbedPickerState.start(root)
+
+            state.enter_hovered_directory()
+            self.assertEqual(nested.resolve(), state.current_dir)
+            self.assertEqual(["guide.md"], [entry.name for entry in state.entries])
+
+            state.move_to_parent()
+
+        self.assertEqual(root.resolve(), state.current_dir)
+        self.assertEqual(["docs"], [entry.name for entry in state.entries])
+
+    def test_picker_tab_on_file_sets_message_without_changing_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            (root / "README.md").write_text("readme", encoding="utf-8")
+            state = EmbedPickerState.start(root)
+
+            state.enter_hovered_directory()
+
+        self.assertEqual(root.resolve(), state.current_dir)
+        self.assertEqual("Tab enters directories only.", state.message)

@@ -56,6 +56,56 @@ class EmbedPickerState:
             cursor_index=self.cursor_index,
         )
 
+    def hovered_entry(self) -> EmbedPickerEntry | None:
+        if not self.entries:
+            return None
+        return self.entries[self.cursor_index]
+
+    def move_up(self) -> None:
+        if self.entries:
+            self.cursor_index = max(0, self.cursor_index - 1)
+        self.message = ""
+        self.reload()
+
+    def move_down(self) -> None:
+        if self.entries:
+            self.cursor_index = min(len(self.entries) - 1, self.cursor_index + 1)
+        self.message = ""
+        self.reload()
+
+    def toggle_selection(self) -> None:
+        entry = self.hovered_entry()
+        if entry is None:
+            return
+        if entry.path in self.selected_paths:
+            self.selected_paths.remove(entry.path)
+        else:
+            self.selected_paths.add(entry.path)
+        self.message = ""
+        self.reload()
+
+    def enter_hovered_directory(self) -> None:
+        entry = self.hovered_entry()
+        if entry is None:
+            return
+        if not entry.is_dir:
+            self.message = "Tab enters directories only."
+            self.reload()
+            return
+        self.current_dir = entry.path.resolve()
+        self.cursor_index = 0
+        self.message = ""
+        self.reload()
+
+    def move_to_parent(self) -> None:
+        parent = self.current_dir.parent.resolve()
+        if parent == self.current_dir:
+            return
+        self.current_dir = parent
+        self.cursor_index = 0
+        self.message = ""
+        self.reload()
+
 
 def format_file_size(size: int) -> str:
     if size < 1024:
