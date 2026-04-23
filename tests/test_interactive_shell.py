@@ -357,6 +357,8 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertIn("Embed Files: qwen3-embedding:8b", frame)
         self.assertLess(frame.index("Embed Files: qwen3-embedding:8b"), frame.index("Runic interactive shell"))
         self.assertIn("Enter embed selected", frame)
+        self.assertEqual(16, len(lines))
+        self.assertEqual("+" + "-" * 88 + "+", lines[-1])
         self.assertTrue(all(len(line) == 90 for line in lines))
 
     def test_render_shell_frame_keeps_default_pane_on_right(self) -> None:

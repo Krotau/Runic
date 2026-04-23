@@ -226,23 +226,21 @@ def render_shell_frame(frame: ShellFrame) -> str:
 
     if pane.layout == "wide":
         pane_lines = _pane_lines(pane)
-        pane_height = min(max(4, len(pane_lines) + 2), max(4, height // 2) + 2)
-        max_pane_lines = max(1, pane_height - 2)
-        if len(pane_lines) > max_pane_lines and max_pane_lines > 1:
-            pane_lines = [pane_lines[0], *pane_lines[-(max_pane_lines - 1):]]
+        content_height = max(0, height - 6)
+        output_rows = min(len(output), max(1, content_height - 7)) if output else 0
+        pane_rows = min(len(pane_lines), max(0, content_height - output_rows))
+        if pane_rows < len(pane_lines):
+            if pane_rows <= 1:
+                pane_lines = pane_lines[:pane_rows]
+            else:
+                pane_lines = [pane_lines[0], *pane_lines[-(pane_rows - 1):]]
         else:
-            pane_lines = pane_lines[:max_pane_lines]
+            pane_lines = pane_lines[:pane_rows]
         rows.append(_border(width))
         for line in pane_lines:
             rows.append(_row(line, width))
-        while len(rows) < pane_height:
-            rows.append(_row("", width))
-        rows.append(_border(width))
-        body_height = max(1, height - len(rows) - 2)
-        for line in output[-body_height:]:
+        for line in output[-output_rows:]:
             rows.append(_row(line, width))
-        while len(rows) < height - 2:
-            rows.append(_row("", width))
         rows.append(_border(width))
         rows.append(_row(frame.prompt, width))
         rows.append(_border(width))
