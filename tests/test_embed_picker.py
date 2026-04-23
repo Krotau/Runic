@@ -183,6 +183,7 @@ class TestEmbedPicker(unittest.TestCase):
             expanded = expand_selected_paths([docs, duplicate, duplicate, root / "image.png", root / "bad.txt"])
 
         self.assertEqual([keep.resolve(), duplicate.resolve()], [item.path for item in expanded.files])
+        self.assertEqual(["keep", "duplicate"], [item.text for item in expanded.files])
         self.assertEqual(3, expanded.skipped)
 
     def test_expand_selected_paths_returns_zero_files_for_only_skipped_directory(self) -> None:
@@ -197,4 +198,26 @@ class TestEmbedPicker(unittest.TestCase):
             expanded = expand_selected_paths([skipped_dir])
 
         self.assertEqual(tuple(), expanded.files)
+        self.assertEqual(1, expanded.skipped)
+
+    @unittest.skipUnless(hasattr(Path, "symlink_to"), "Path.symlink_to is unavailable")
+    def test_expand_selected_paths_skips_symlinked_directories(self) -> None:
+        from runic.interactive.embed_picker import expand_selected_paths
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            real_dir = root / "real"
+            real_dir.mkdir()
+            real_file = real_dir / "keep.md"
+            real_file.write_text("keep", encoding="utf-8")
+            symlink_dir = root / "linked-real"
+            try:
+                symlink_dir.symlink_to(real_dir, target_is_directory=True)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+
+            expanded = expand_selected_paths([root])
+
+        self.assertEqual([real_file.resolve()], [item.path for item in expanded.files])
+        self.assertEqual(["keep"], [item.text for item in expanded.files])
         self.assertEqual(1, expanded.skipped)

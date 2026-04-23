@@ -229,6 +229,8 @@ def _entry_line(entry: EmbedPickerEntry) -> str:
 
 
 def should_skip_path(path: Path) -> bool:
+    if path.is_symlink() and path.is_dir():
+        return True
     if path.is_dir():
         return path.name in DEFAULT_SKIPPED_DIRECTORY_NAMES
     return path.suffix.lower() in DEFAULT_SKIPPED_FILE_EXTENSIONS
