@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 from runic import DefaultError, Err, Ok, Result
 
+from ..install_status import InstallPhase, InstallPhaseState, InstallStatusUpdate, encode_install_status
 from ..models import ChatMessage, InstalledModel, ModelInstallStatus, ModelProvider, ModelReference
 from .base import ModelRunner, RunnerCapability, RunnerChatError, RunnerContext
 
@@ -17,11 +19,13 @@ RunCommand = Callable[[tuple[str, ...]], Awaitable[Result[Sequence[str], Default
 ChatHttp = Callable[[str, dict[str, object]], Awaitable[dict[str, object]]]
 ListHttp = Callable[[str], Awaitable[dict[str, object]]]
 EmbedHttp = Callable[[str, dict[str, object]], Awaitable[dict[str, object]]]
+PullHttp = Callable[[str, dict[str, object]], AsyncIterator[dict[str, object]]]
 ChatClient = Callable[[str, tuple[ChatMessage, ...]], AsyncIterator[str]]
 
 DEFAULT_CHAT_URL = "http://127.0.0.1:11434/api/chat"
 DEFAULT_EMBED_URL = "http://127.0.0.1:11434/api/embed"
 DEFAULT_TAGS_URL = "http://127.0.0.1:11434/api/tags"
+DEFAULT_PULL_URL = "http://127.0.0.1:11434/api/pull"
 
 
 def _default_command_exists(command: str) -> bool:
@@ -195,6 +199,48 @@ async def _default_http_list_models(url: str) -> dict[str, object]:
     return await asyncio.to_thread(_get_json)
 
 
+async def _default_http_pull(url: str, payload: dict[str, object]) -> AsyncIterator[dict[str, object]]:
+    queue: asyncio.Queue[object] = asyncio.Queue()
+    sentinel = object()
+    loop = asyncio.get_running_loop()
+
+    def _enqueue(item: object) -> None:
+        asyncio.run_coroutine_threadsafe(queue.put(item), loop).result()
+
+    def _stream_json_lines() -> None:
+        try:
+            data = json.dumps(payload).encode("utf-8")
+            request = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    decoded = json.loads(line)
+                    _enqueue(decoded)
+        except Exception as exc:  # pragma: no cover - surfaced via iterator below
+            _enqueue(exc)
+        finally:
+            _enqueue(sentinel)
+
+    threading.Thread(target=_stream_json_lines, daemon=True).start()
+
+    while True:
+        item = await queue.get()
+        if item is sentinel:
+            return
+        if isinstance(item, Exception):
+            raise item
+        if not isinstance(item, dict):
+            raise ValueError("Ollama pull response must be a JSON object")
+        yield item
+
+
 async def _default_chat_client(
     model: str,
     messages: tuple[ChatMessage, ...],
@@ -231,6 +277,36 @@ def _manual_install_error() -> Err[DefaultError]:
     )
 
 
+def _pull_progress(update: dict[str, object]) -> float | None:
+    completed = update.get("completed")
+    total = update.get("total")
+    if not isinstance(completed, int | float):
+        return None
+    if not isinstance(total, int | float) or total <= 0:
+        return None
+    return min(1.0, max(0.0, float(completed) / float(total)))
+
+
+async def _log_install_update(
+    context: RunnerContext,
+    phase: InstallPhase,
+    state: InstallPhaseState,
+    *,
+    detail: str = "",
+    progress: float | None = None,
+) -> None:
+    await context.log(
+        encode_install_status(
+            InstallStatusUpdate(
+                phase=phase,
+                state=state,
+                detail=detail,
+                progress=progress,
+            )
+        )
+    )
+
+
 class OllamaRunner(ModelRunner):
     name = "ollama"
     capabilities = (RunnerCapability(provider=ModelProvider.OLLAMA, can_embed=True),)
@@ -239,17 +315,17 @@ class OllamaRunner(ModelRunner):
         self,
         *,
         command_exists: CommandExists | None = None,
-        run_command: RunCommand | None = None,
         chat_http: ChatHttp | None = None,
         list_http: ListHttp | None = None,
         embed_http: EmbedHttp | None = None,
+        pull_http: PullHttp | None = None,
         chat_client: ChatClient | None = None,
     ) -> None:
         self._command_exists = command_exists or _default_command_exists
-        self._run_command = run_command or _default_run_command
         self._chat_http = chat_http or _default_http_chat
         self._list_http = list_http or _default_http_list_models
         self._embed_http = embed_http or _default_http_embed
+        self._pull_http = pull_http or _default_http_pull
         if chat_client is None:
 
             async def default_chat_client(model: str, messages: tuple[ChatMessage, ...]) -> AsyncIterator[str]:
@@ -272,23 +348,108 @@ class OllamaRunner(ModelRunner):
         if not await self.is_available():
             return Err(DefaultError(message="Ollama is not installed.", code="runner_unavailable"))
 
-        result = await self._run_command((self.name, "pull", reference.model))
-        match result:
-            case Err() as error:
-                return error
-            case Ok() as ok:
-                for line in ok.value:
-                    await context.log(line)
-                await context.progress(1.0)
-                return Ok(
-                    InstalledModel(
-                        name=reference.local_name,
-                        provider=reference.provider,
-                        source=reference.source,
-                        runner=self.name,
-                        status=ModelInstallStatus.INSTALLED,
+        connected = False
+        seen_success = False
+        await _log_install_update(context, InstallPhase.CONNECTING, InstallPhaseState.ACTIVE)
+
+        try:
+            async for update in self._pull_http(DEFAULT_PULL_URL, {"model": reference.model, "stream": True}):
+                if "error" in update:
+                    return Err(
+                        DefaultError(
+                            message="Failed to install model with Ollama.",
+                            code="runner_install_failed",
+                            details=update,
+                        )
+                    )
+
+                status = str(update.get("status", "")).strip()
+                if status:
+                    await context.log(status)
+
+                if not connected:
+                    await _log_install_update(context, InstallPhase.CONNECTING, InstallPhaseState.DONE)
+                    connected = True
+
+                progress = _pull_progress(update)
+                await _log_install_update(
+                    context,
+                    InstallPhase.DOWNLOADING,
+                    InstallPhaseState.ACTIVE,
+                    detail=status,
+                    progress=progress,
+                )
+                if progress is not None:
+                    await context.progress(progress)
+
+                if status.lower() == "success":
+                    seen_success = True
+
+            if not connected:
+                return Err(
+                    DefaultError(
+                        message="Failed to connect to Ollama.",
+                        code="runner_install_connect_failed",
                     )
                 )
+            if not seen_success:
+                return Err(
+                    DefaultError(
+                        message="Ollama pull did not report success.",
+                        code="runner_install_failed",
+                    )
+                )
+
+            await _log_install_update(context, InstallPhase.VERIFYING, InstallPhaseState.ACTIVE)
+            models = await self.list_models()
+            match models:
+                case Err(error=error):
+                    return Err(
+                        DefaultError(
+                            message="Failed to verify installed model with Ollama.",
+                            code="runner_install_verify_failed",
+                            details=error.details,
+                        )
+                    )
+                case Ok(value=installed_models):
+                    if not any(model.name == reference.local_name for model in installed_models):
+                        return Err(
+                            DefaultError(
+                                message="Model download finished but verification failed.",
+                                code="runner_install_verify_failed",
+                                details={"model": reference.local_name},
+                            )
+                        )
+
+            await _log_install_update(context, InstallPhase.VERIFYING, InstallPhaseState.DONE)
+            await _log_install_update(context, InstallPhase.INSTALLING, InstallPhaseState.ACTIVE)
+            await context.progress(1.0)
+            await _log_install_update(context, InstallPhase.INSTALLING, InstallPhaseState.DONE)
+            return Ok(
+                InstalledModel(
+                    name=reference.local_name,
+                    provider=reference.provider,
+                    source=reference.source,
+                    runner=self.name,
+                    status=ModelInstallStatus.INSTALLED,
+                )
+            )
+        except urllib.error.HTTPError as exc:
+            return Err(
+                DefaultError(
+                    message="Failed to connect to Ollama.",
+                    code="runner_install_connect_failed",
+                    details=_http_error_details(exc),
+                )
+            )
+        except Exception as exc:
+            return Err(
+                DefaultError(
+                    message="Failed to install model with Ollama.",
+                    code="runner_install_failed",
+                    details={"model": reference.model, "error": str(exc)},
+                )
+            )
 
     async def list_models(self) -> Result[list[InstalledModel], DefaultError]:
         if not await self.is_available():

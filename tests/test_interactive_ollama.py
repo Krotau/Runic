@@ -7,6 +7,7 @@ import urllib.error
 from collections.abc import AsyncIterator
 
 from runic import DefaultError, Err, Ok
+from runic.interactive.install_status import InstallPhase, InstallPhaseState, parse_install_status
 from runic.interactive.models import ChatMessage, InstalledModel, ModelInstallStatus, ModelProvider, ModelReference
 from runic.interactive.runners.base import RunnerChatError
 from runic.interactive.runners.ollama import OllamaRunner
@@ -48,14 +49,20 @@ class TestInteractiveOllamaRunner(unittest.IsolatedAsyncioTestCase):
         assert isinstance(result, Err)
         self.assertEqual("runner_install_manual", result.error.code)
 
-    async def test_install_model_runs_pull_and_records_installed_model(self) -> None:
-        commands: list[tuple[str, ...]] = []
+    async def test_install_model_streams_pull_updates_and_verifies_tags(self) -> None:
+        captured: dict[str, object] = {}
 
-        async def run_command(command: tuple[str, ...]) -> Ok[list[str]]:
-            commands.append(command)
-            return Ok(["pulling manifest", "success"])
+        async def pull_http(url: str, payload: dict[str, object]) -> AsyncIterator[dict[str, object]]:
+            captured["url"] = url
+            captured["payload"] = payload
+            yield {"status": "pulling manifest"}
+            yield {"status": "downloading", "completed": 50, "total": 100}
+            yield {"status": "success"}
 
-        runner = OllamaRunner(command_exists=lambda _: True, run_command=run_command)
+        async def list_http(_: str) -> dict[str, object]:
+            return {"models": [{"name": "llama3.2"}]}
+
+        runner = OllamaRunner(command_exists=lambda _: True, pull_http=pull_http, list_http=list_http)
         context = FakeContext()
         ref = ModelReference(
             provider=ModelProvider.OLLAMA,
@@ -66,9 +73,10 @@ class TestInteractiveOllamaRunner(unittest.IsolatedAsyncioTestCase):
 
         result = await runner.install_model(ref, context)
 
-        self.assertEqual([("ollama", "pull", "llama3.2")], commands)
         self.assertIsInstance(result, Ok)
         assert isinstance(result, Ok)
+        self.assertEqual("http://127.0.0.1:11434/api/pull", captured["url"])
+        self.assertEqual({"model": "llama3.2", "stream": True}, captured["payload"])
         self.assertEqual(
             InstalledModel(
                 name="llama3.2",
@@ -79,7 +87,26 @@ class TestInteractiveOllamaRunner(unittest.IsolatedAsyncioTestCase):
             ),
             result.value,
         )
-        self.assertEqual(["pulling manifest", "success"], context.logs)
+        self.assertIn("pulling manifest", context.logs)
+        structured = [parse_install_status(message) for message in context.logs]
+        structured = [message for message in structured if message is not None]
+        self.assertIn(
+            InstallPhase.CONNECTING,
+            [message.phase for message in structured],
+        )
+        self.assertIn(
+            InstallPhase.VERIFYING,
+            [message.phase for message in structured],
+        )
+        self.assertIn(
+            InstallPhase.INSTALLING,
+            [message.phase for message in structured],
+        )
+        self.assertIn(
+            InstallPhaseState.DONE,
+            [message.state for message in structured if message.phase is InstallPhase.VERIFYING],
+        )
+        self.assertIn(0.5, context.progress_values)
         self.assertEqual(1.0, context.progress_values[-1])
 
     async def test_chat_yields_injected_chunks(self) -> None:
@@ -252,11 +279,11 @@ class TestInteractiveOllamaRunner(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("runner_list_failed", result.error.code)
         self.assertEqual({"error": "tags unavailable"}, result.error.details)
 
-    async def test_install_model_propagates_pull_failure(self) -> None:
-        async def run_command(_: tuple[str, ...]) -> Err[DefaultError]:
-            return Err(DefaultError(message="command failed", code="runner_command_failed"))
+    async def test_install_model_returns_error_when_pull_stream_contains_error_payload(self) -> None:
+        async def pull_http(_: str, __: dict[str, object]) -> AsyncIterator[dict[str, object]]:
+            yield {"error": "model not found"}
 
-        runner = OllamaRunner(command_exists=lambda _: True, run_command=run_command)
+        runner = OllamaRunner(command_exists=lambda _: True, pull_http=pull_http)
         context = FakeContext()
         ref = ModelReference(
             provider=ModelProvider.OLLAMA,
@@ -269,4 +296,27 @@ class TestInteractiveOllamaRunner(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(result, Err)
         assert isinstance(result, Err)
-        self.assertEqual("runner_command_failed", result.error.code)
+        self.assertEqual("runner_install_failed", result.error.code)
+        self.assertEqual({"error": "model not found"}, result.error.details)
+
+    async def test_install_model_returns_error_when_verification_does_not_find_model(self) -> None:
+        async def pull_http(_: str, __: dict[str, object]) -> AsyncIterator[dict[str, object]]:
+            yield {"status": "success"}
+
+        async def list_http(_: str) -> dict[str, object]:
+            return {"models": [{"name": "other-model"}]}
+
+        runner = OllamaRunner(command_exists=lambda _: True, pull_http=pull_http, list_http=list_http)
+        context = FakeContext()
+        ref = ModelReference(
+            provider=ModelProvider.OLLAMA,
+            source="ollama://llama3.2",
+            model="llama3.2",
+            local_name="llama3.2",
+        )
+
+        result = await runner.install_model(ref, context)
+
+        self.assertIsInstance(result, Err)
+        assert isinstance(result, Err)
+        self.assertEqual("runner_install_verify_failed", result.error.code)
