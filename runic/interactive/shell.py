@@ -13,6 +13,7 @@ from runic import DefaultError, Err, Ok, Result, Runic
 
 from .controller import ModelController
 from .embed_picker import EmbedPickerProgress, EmbedPickerState, expand_selected_paths
+from .install_status import InstallPhase, InstallStatusUpdate, format_install_line, parse_install_status
 from .models import ChatMessage
 from .registry import ModelRegistry, default_registry_path
 from .runners.base import RunnerChatError
@@ -189,6 +190,7 @@ class TuiShellState:
 COMMAND_COMPLETIONS = ("install", "chat", "embed", "help", "exit")
 MODEL_COMPLETION_COMMANDS = ("chat", "embed")
 MIN_SIDE_PANE_WIDTH = 72
+INSTALL_PANE_FOOTER = ("Esc: hide pane", "Enter: details")
 
 
 def _fit(text: object, width: int) -> str:
@@ -279,7 +281,7 @@ def render_shell_frame(frame: ShellFrame) -> str:
         rows.append(_border(width))
         return "\n".join(rows[:height])
 
-    pane_width = min(28, max(22, width // 3))
+    pane_width = min(40, max(22, width // 3))
     left_width = width - pane_width - 1
     pane_lines = _pane_lines(pane)
     body_height = max(1, height - 5)
@@ -330,6 +332,89 @@ def format_install_pane(model: str, progress: float, lines: Sequence[str]) -> st
     rendered.extend(f"| {line.ljust(width)} |" for line in body)
     rendered.append(border)
     return "\n".join(rendered)
+
+
+def _set_install_phase_pane(state: TuiShellState, model: str, message: str, progress: float) -> None:
+    update = parse_install_status(message)
+    if update is None:
+        state.set_pane(
+            PaneState(
+                title="Install",
+                lines=(model, message),
+                footer=INSTALL_PANE_FOOTER,
+            )
+        )
+        return
+
+    if update.phase is InstallPhase.DOWNLOADING and update.progress is None:
+        update = InstallStatusUpdate(
+            phase=update.phase,
+            state=update.state,
+            detail=update.detail,
+            progress=progress,
+        )
+    lines: list[str] = [model, format_install_line(update, width=14)]
+    if update.detail:
+        lines.append(update.detail)
+    state.set_pane(
+        PaneState(
+            title="Install",
+            lines=tuple(lines),
+            footer=INSTALL_PANE_FOOTER,
+        )
+    )
+
+
+async def _track_install_until_settled(
+    controller: ModelController,
+    spell_id: str,
+    model: str,
+    state: TuiShellState,
+    refresh: Callable[[], None],
+) -> Result[object, DefaultError]:
+    wait_task = asyncio.create_task(controller.wait_for_install(spell_id))
+    log_events = controller.install_log_events()
+    try:
+        while not wait_task.done():
+            try:
+                event = await asyncio.wait_for(anext(log_events), timeout=0.05)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                continue
+            if event.data.spell_id != spell_id:
+                continue
+            record = controller.get_install_record(spell_id)
+            progress = 0.0
+            if isinstance(record, Ok):
+                progress = record.value.progress
+            _set_install_phase_pane(state, model, event.data.message, progress)
+            refresh()
+    finally:
+        await log_events.aclose()
+
+    result = await wait_task
+    match result:
+        case Ok():
+            state.append("Installation completed")
+            state.set_pane(
+                PaneState(
+                    title="Install",
+                    lines=(model, "installing.... done!"),
+                    footer=INSTALL_PANE_FOOTER,
+                )
+            )
+        case Err(error=error):
+            state.append(_format_error(error))
+            state.set_pane(
+                PaneState(
+                    title="Install",
+                    lines=(model, _format_error(error)),
+                    footer=INSTALL_PANE_FOOTER,
+                )
+            )
+    refresh()
+    return result
 
 
 def _cli_extras_message() -> str:
@@ -636,25 +721,28 @@ def _run_tui_application(controller: ModelController) -> int:
                     return
                 state.append(f"> install {command.argument}")
                 state.append("Resolving model reference...")
-                set_install_pane(command.argument, "starting", "waiting for runner")
+                state.set_pane(
+                    PaneState(
+                        title="Install",
+                        lines=(command.argument, "connecting...."),
+                        footer=INSTALL_PANE_FOOTER,
+                    )
+                )
                 refresh()
                 result = await controller.install(command.argument)
                 match result:
                     case Err(error=error):
                         state.append(_format_error(error))
-                        set_install_pane(command.argument, "failed", _format_error(error))
+                        state.set_pane(
+                            PaneState(
+                                title="Install",
+                                lines=(command.argument, _format_error(error)),
+                                footer=INSTALL_PANE_FOOTER,
+                            )
+                        )
                     case Ok(value=spell_id):
                         state.append(f"Installation scheduled: {spell_id}")
-                        set_install_pane(command.argument, "running", f"spell {spell_id}")
-                        refresh()
-                        settled = await controller.wait_for_install(spell_id)
-                        match settled:
-                            case Ok():
-                                state.append("Installation completed")
-                                set_install_pane(command.argument, "############# 100%", "Installation completed")
-                            case Err(error=error):
-                                state.append(_format_error(error))
-                                set_install_pane(command.argument, "failed", _format_error(error))
+                        await _track_install_until_settled(controller, spell_id, command.argument, state, refresh)
                 refresh()
             case ShellCommand.CHAT:
                 if command.argument is None:
@@ -1203,8 +1291,8 @@ def run_interactive(
                     output_lines.append("Resolving model reference...")
                     active_pane = PaneState(
                         title="Install",
-                        lines=(command.argument, "starting", "waiting for runner"),
-                        footer=("Esc: hide pane", "Enter: details"),
+                        lines=(command.argument, "connecting...."),
+                        footer=INSTALL_PANE_FOOTER,
                     )
                     _redraw_frame(
                         active_console,
@@ -1213,13 +1301,46 @@ def run_interactive(
                         status=active_status,
                         pane=active_pane,
                     )
-                    asyncio.run(_install_and_wait(active_controller, command.argument, active_console))
-                    output_lines.append("Installation completed")
-                    active_pane = PaneState(
-                        title="Install",
-                        lines=(command.argument, "############# 100%", "Installation completed"),
-                        footer=("Esc: hide pane", "Enter: details"),
-                    )
+
+                    install_state = TuiShellState(output=output_lines, pane=active_pane, status=active_status)
+
+                    def refresh_install() -> None:
+                        nonlocal active_pane
+                        active_pane = install_state.pane
+                        _redraw_frame(
+                            active_console,
+                            output=output_lines,
+                            prompt=f"runic> install {command.argument}",
+                            status=active_status,
+                            pane=active_pane,
+                        )
+
+                    async def run_install() -> None:
+                        result = await active_controller.install(command.argument)
+                        _print_install_result(result, active_console)
+                        match result:
+                            case Ok(value=spell_id):
+                                install_state.append(f"Installation scheduled: {spell_id}")
+                                await _track_install_until_settled(
+                                    active_controller,
+                                    spell_id,
+                                    command.argument,
+                                    install_state,
+                                    refresh_install,
+                                )
+                            case Err(error=error):
+                                install_state.append(_format_error(error))
+                                install_state.set_pane(
+                                    PaneState(
+                                        title="Install",
+                                        lines=(command.argument, _format_error(error)),
+                                        footer=INSTALL_PANE_FOOTER,
+                                    )
+                                )
+                                refresh_install()
+
+                    asyncio.run(run_install())
+                    active_pane = install_state.pane
             case ShellCommand.CHAT:
                 if command.argument is None:
                     message = "Use chat <model>."
