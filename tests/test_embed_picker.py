@@ -162,3 +162,39 @@ class TestEmbedPicker(unittest.TestCase):
         progress = EmbedPickerProgress(total=24, processed=7, succeeded=6, failed=1, skipped=2)
 
         self.assertEqual("Embedding 7/24 files  [####----------]  29%", format_progress_line(progress, width=14))
+
+    def test_expand_selected_paths_recurses_and_skips_noisy_binary_and_non_utf8_files(self) -> None:
+        from runic.interactive.embed_picker import expand_selected_paths
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            docs = root / "docs"
+            docs.mkdir()
+            keep = docs / "keep.md"
+            keep.write_text("keep", encoding="utf-8")
+            duplicate = root / "duplicate.txt"
+            duplicate.write_text("duplicate", encoding="utf-8")
+            skipped_dir = root / "node_modules"
+            skipped_dir.mkdir()
+            (skipped_dir / "package.txt").write_text("skip", encoding="utf-8")
+            (root / "image.png").write_bytes(b"\x89PNG\r\n")
+            (root / "bad.txt").write_bytes(b"\xff\xfe\x00")
+
+            expanded = expand_selected_paths([docs, duplicate, duplicate, root / "image.png", root / "bad.txt"])
+
+        self.assertEqual([keep.resolve(), duplicate.resolve()], [item.path for item in expanded.files])
+        self.assertEqual(3, expanded.skipped)
+
+    def test_expand_selected_paths_returns_zero_files_for_only_skipped_directory(self) -> None:
+        from runic.interactive.embed_picker import expand_selected_paths
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            skipped_dir = root / ".git"
+            skipped_dir.mkdir()
+            (skipped_dir / "config").write_text("config", encoding="utf-8")
+
+            expanded = expand_selected_paths([skipped_dir])
+
+        self.assertEqual([], expanded.files)
+        self.assertEqual(1, expanded.skipped)

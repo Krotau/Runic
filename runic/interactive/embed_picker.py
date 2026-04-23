@@ -4,6 +4,35 @@ from dataclasses import dataclass, field
 from collections.abc import Sequence
 from pathlib import Path
 
+DEFAULT_SKIPPED_DIRECTORY_NAMES = frozenset(
+    {".git", "__pycache__", "node_modules", ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build", ".venv"}
+)
+DEFAULT_SKIPPED_FILE_EXTENSIONS = frozenset(
+    {
+        ".pyc",
+        ".pyo",
+        ".so",
+        ".dll",
+        ".dylib",
+        ".exe",
+        ".bin",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".ico",
+        ".pdf",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".7z",
+        ".mp3",
+        ".mp4",
+        ".mov",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class EmbedPickerEntry:
@@ -22,6 +51,18 @@ class EmbedPickerProgress:
     processed: int = 0
     succeeded: int = 0
     failed: int = 0
+    skipped: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class EmbedReadableFile:
+    path: Path
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class EmbedSelectionExpansion:
+    files: list[EmbedReadableFile]
     skipped: int = 0
 
 
@@ -185,6 +226,60 @@ def _entry_line(entry: EmbedPickerEntry) -> str:
     cursor = ">" if entry.hovered else " "
     selected = "[x]" if entry.selected else "[ ]"
     return f"{cursor} {selected} {entry.type_label} {entry.name:<32} {entry.size_label}"
+
+
+def should_skip_path(path: Path) -> bool:
+    if path.is_dir():
+        return path.name in DEFAULT_SKIPPED_DIRECTORY_NAMES
+    return path.suffix.lower() in DEFAULT_SKIPPED_FILE_EXTENSIONS
+
+
+def _read_utf8_file(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _walk_candidate(path: Path) -> tuple[list[Path], int]:
+    if should_skip_path(path):
+        return ([], 1)
+    if path.is_file():
+        return ([path.resolve()], 0)
+    if not path.is_dir():
+        return ([], 1)
+
+    files: list[Path] = []
+    skipped = 0
+    try:
+        children = sorted(path.iterdir(), key=lambda child: (not child.is_dir(), child.name.lower(), child.name))
+    except OSError:
+        return ([], 1)
+    for child in children:
+        child_files, child_skipped = _walk_candidate(child)
+        files.extend(child_files)
+        skipped += child_skipped
+    return (files, skipped)
+
+
+def expand_selected_paths(paths: Sequence[Path]) -> EmbedSelectionExpansion:
+    seen: set[Path] = set()
+    readable: list[EmbedReadableFile] = []
+    skipped = 0
+    for selected_path in paths:
+        candidate_files, candidate_skipped = _walk_candidate(selected_path.expanduser())
+        skipped += candidate_skipped
+        for path in candidate_files:
+            if path in seen:
+                skipped += 1
+                continue
+            seen.add(path)
+            text = _read_utf8_file(path)
+            if text is None:
+                skipped += 1
+                continue
+            readable.append(EmbedReadableFile(path=path, text=text))
+    return EmbedSelectionExpansion(files=readable, skipped=skipped)
 
 
 def list_embed_picker_entries(
