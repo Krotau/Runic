@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections.abc import Sequence
 from pathlib import Path
 
 
@@ -106,6 +107,41 @@ class EmbedPickerState:
         self.message = ""
         self.reload()
 
+    def selected_count_label(self) -> str:
+        return _plural(len(self.selected_paths), "item")
+
+    def format_lines(self) -> Sequence[str]:
+        lines: list[str] = [
+            "Pick files to parse. Space multi-select, Tab enters dirs, Enter embeds selected.",
+            f"cwd {self.current_dir}",
+            "",
+        ]
+        lines.extend(_entry_line(entry) for entry in self.entries)
+        lines.append("")
+        lines.append(f"Selected: {self.selected_count_label()}")
+        if self.progress is not None:
+            lines.append(format_progress_line(self.progress))
+        if self.message:
+            lines.append(self.message)
+        return tuple(lines)
+
+    def format_rich_text(self) -> object:
+        from rich.text import Text
+
+        text = Text()
+        for line_index, line in enumerate(self.format_lines()):
+            if line_index:
+                text.append("\n")
+            if "[dir]" in line:
+                text.append(line, style="bold cyan")
+            elif "[x]" in line:
+                text.append(line, style="green")
+            elif line.startswith(">"):
+                text.append(line, style="reverse")
+            else:
+                text.append(line)
+        return text
+
 
 def format_file_size(size: int) -> str:
     if size < 1024:
@@ -128,6 +164,27 @@ def _size_label(path: Path, *, is_dir: bool) -> str:
         return format_file_size(path.stat().st_size)
     except OSError:
         return "unreadable"
+
+
+def _plural(count: int, singular: str, plural: str | None = None) -> str:
+    if count == 1:
+        return f"{count} {singular}"
+    return f"{count} {plural or singular + 's'}"
+
+
+def format_progress_line(progress: EmbedPickerProgress, *, width: int = 14) -> str:
+    if progress.total <= 0:
+        return "Embedding 0/0 files  [" + "-" * width + "]  0%"
+    ratio = min(1.0, max(0.0, progress.processed / progress.total))
+    filled = round(ratio * width)
+    percent = round(ratio * 100)
+    return f"Embedding {progress.processed}/{progress.total} files  [{'#' * filled}{'-' * (width - filled)}]  {percent}%"
+
+
+def _entry_line(entry: EmbedPickerEntry) -> str:
+    cursor = ">" if entry.hovered else " "
+    selected = "[x]" if entry.selected else "[ ]"
+    return f"{cursor} {selected} {entry.type_label} {entry.name:<32} {entry.size_label}"
 
 
 def list_embed_picker_entries(

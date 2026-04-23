@@ -123,3 +123,42 @@ class TestEmbedPicker(unittest.TestCase):
 
         self.assertEqual(root.resolve(), state.current_dir)
         self.assertEqual("Tab enters directories only.", state.message)
+
+    def test_format_picker_lines_includes_instructions_rows_and_selection_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            (root / "src").mkdir()
+            (root / "README.md").write_text("hello", encoding="utf-8")
+            state = EmbedPickerState.start(root, model="qwen3-embedding:8b")
+            state.toggle_selection()
+
+            lines = state.format_lines()
+
+        rendered = "\n".join(lines)
+        self.assertIn(
+            "Pick files to parse. Space multi-select, Tab enters dirs, Enter embeds selected.",
+            rendered,
+        )
+        self.assertIn(f"cwd {root.resolve()}", rendered)
+        self.assertIn("> [x] [dir] src", rendered)
+        self.assertIn("directory", rendered)
+        self.assertIn("  [ ] .md", rendered)
+        self.assertIn("Selected: 1 item", rendered)
+
+    def test_format_picker_lines_has_rich_text_variant_with_styles(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            (root / "src").mkdir()
+            state = EmbedPickerState.start(root, model="qwen3-embedding:8b")
+
+            text = state.format_rich_text()
+
+        self.assertEqual("\n".join(state.format_lines()), text.plain)
+        self.assertIn("bold cyan", str(text.spans[0].style))
+
+    def test_format_progress_line_counts_processed_files(self) -> None:
+        from runic.interactive.embed_picker import EmbedPickerProgress, format_progress_line
+
+        progress = EmbedPickerProgress(total=24, processed=7, succeeded=6, failed=1, skipped=2)
+
+        self.assertEqual("Embedding 7/24 files  [####----------]  29%", format_progress_line(progress, width=14))
