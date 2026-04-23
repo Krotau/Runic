@@ -320,3 +320,62 @@ class TestInteractiveOllamaRunner(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(result, Err)
         assert isinstance(result, Err)
         self.assertEqual("runner_install_verify_failed", result.error.code)
+
+    async def test_install_model_aggregates_download_progress_across_digests(self) -> None:
+        async def pull_http(_: str, __: dict[str, object]) -> AsyncIterator[dict[str, object]]:
+            yield {"status": "pulling manifest"}
+            yield {"status": "pulling sha256:a", "digest": "sha256:a", "total": 100, "completed": 0}
+            yield {"status": "pulling sha256:b", "digest": "sha256:b", "total": 300, "completed": 0}
+            yield {"status": "pulling sha256:a", "digest": "sha256:a", "total": 100, "completed": 100}
+            yield {"status": "pulling sha256:b", "digest": "sha256:b", "total": 300, "completed": 150}
+            yield {"status": "success"}
+
+        async def list_http(_: str) -> dict[str, object]:
+            return {"models": [{"name": "llama3.2"}]}
+
+        runner = OllamaRunner(command_exists=lambda _: True, pull_http=pull_http, list_http=list_http)
+        context = FakeContext()
+        ref = ModelReference(
+            provider=ModelProvider.OLLAMA,
+            source="ollama://llama3.2",
+            model="llama3.2",
+            local_name="llama3.2",
+        )
+
+        result = await runner.install_model(ref, context)
+
+        self.assertIsInstance(result, Ok)
+        assert isinstance(result, Ok)
+        self.assertIn(0.25, context.progress_values)
+        self.assertIn(0.625, context.progress_values)
+        self.assertEqual(1.0, context.progress_values[-1])
+
+    async def test_install_model_maps_verifying_and_installing_stream_statuses(self) -> None:
+        async def pull_http(_: str, __: dict[str, object]) -> AsyncIterator[dict[str, object]]:
+            yield {"status": "pulling manifest"}
+            yield {"status": "verifying sha256 digest"}
+            yield {"status": "writing manifest"}
+            yield {"status": "removing any unused layers"}
+            yield {"status": "success"}
+
+        async def list_http(_: str) -> dict[str, object]:
+            return {"models": [{"name": "llama3.2"}]}
+
+        runner = OllamaRunner(command_exists=lambda _: True, pull_http=pull_http, list_http=list_http)
+        context = FakeContext()
+        ref = ModelReference(
+            provider=ModelProvider.OLLAMA,
+            source="ollama://llama3.2",
+            model="llama3.2",
+            local_name="llama3.2",
+        )
+
+        result = await runner.install_model(ref, context)
+
+        self.assertIsInstance(result, Ok)
+        assert isinstance(result, Ok)
+        structured = [parse_install_status(message) for message in context.logs]
+        structured = [message for message in structured if message is not None]
+        phases = [(message.phase, message.state, message.detail) for message in structured]
+        self.assertIn((InstallPhase.VERIFYING, InstallPhaseState.ACTIVE, "verifying sha256 digest"), phases)
+        self.assertIn((InstallPhase.INSTALLING, InstallPhaseState.ACTIVE, "writing manifest"), phases)

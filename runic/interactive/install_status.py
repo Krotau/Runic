@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 LOG_PREFIX = "runic-install:"
+SPINNER_FRAMES = ("⠾", "⠽", "⠻", "⠯", "⠷")
 
 
 class InstallPhase(str, Enum):
@@ -62,17 +63,41 @@ def parse_install_status(message: str) -> InstallStatusUpdate | None:
         return None
 
 
-def format_install_line(update: InstallStatusUpdate, *, width: int = 14) -> str:
+def spinner_frame(step: int) -> str:
+    return SPINNER_FRAMES[step % len(SPINNER_FRAMES)]
+
+
+def _with_spinner(text: str, update: InstallStatusUpdate, spinner: str | None) -> str:
+    if spinner is None or update.state is not InstallPhaseState.ACTIVE:
+        return text
+    if update.phase not in {
+        InstallPhase.CONNECTING,
+        InstallPhase.DOWNLOADING,
+        InstallPhase.VERIFYING,
+        InstallPhase.INSTALLING,
+    }:
+        return text
+    return f"{spinner} {text}"
+
+
+def format_install_line(update: InstallStatusUpdate, *, width: int = 14, spinner: str | None = None) -> str:
     if update.phase is InstallPhase.CONNECTING:
-        return "connecting.... connected!" if update.state is InstallPhaseState.DONE else "connecting...."
+        text = "connecting.... connected!" if update.state is InstallPhaseState.DONE else "connecting...."
+        return _with_spinner(text, update, spinner)
     if update.phase is InstallPhase.DOWNLOADING:
         ratio = min(1.0, max(0.0, update.progress or 0.0))
         filled = round(ratio * width)
-        return f"downloading... [{'#' * filled}{'_' * (width - filled)}] {round(ratio * 100)}%"
+        return _with_spinner(
+            f"downloading... [{'#' * filled}{'_' * (width - filled)}] {round(ratio * 100)}%",
+            update,
+            spinner,
+        )
     if update.phase is InstallPhase.VERIFYING:
-        return "verifying.... verified!" if update.state is InstallPhaseState.DONE else "verifying...."
+        text = "verifying.... verified!" if update.state is InstallPhaseState.DONE else "verifying...."
+        return _with_spinner(text, update, spinner)
     if update.phase is InstallPhase.INSTALLING:
-        return "installing.... done!" if update.state is InstallPhaseState.DONE else "installing...."
+        text = "installing.... done!" if update.state is InstallPhaseState.DONE else "installing...."
+        return _with_spinner(text, update, spinner)
     if update.phase is InstallPhase.FAILED:
         return f"failed: {update.detail}" if update.detail else "failed"
     return "installed"

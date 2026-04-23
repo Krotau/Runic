@@ -7,6 +7,7 @@ import threading
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from dataclasses import dataclass, field
 
 from runic import DefaultError, Err, Ok, Result
 
@@ -287,6 +288,43 @@ def _pull_progress(update: dict[str, object]) -> float | None:
     return min(1.0, max(0.0, float(completed) / float(total)))
 
 
+@dataclass(slots=True)
+class _PullProgressTracker:
+    totals_by_digest: dict[str, float] = field(default_factory=dict)
+    completed_by_digest: dict[str, float] = field(default_factory=dict)
+
+    def progress(self, update: dict[str, object]) -> float | None:
+        digest = update.get("digest")
+        total = update.get("total")
+        completed = update.get("completed")
+        if isinstance(digest, str) and isinstance(total, int | float) and total > 0:
+            total_value = float(total)
+            self.totals_by_digest[digest] = total_value
+            if isinstance(completed, int | float):
+                self.completed_by_digest[digest] = min(total_value, max(0.0, float(completed)))
+            elif digest not in self.completed_by_digest:
+                self.completed_by_digest[digest] = 0.0
+
+            total_bytes = sum(self.totals_by_digest.values())
+            if total_bytes <= 0:
+                return None
+            completed_bytes = sum(
+                min(self.completed_by_digest.get(name, 0.0), size)
+                for name, size in self.totals_by_digest.items()
+            )
+            return min(1.0, max(0.0, completed_bytes / total_bytes))
+        return _pull_progress(update)
+
+
+def _phase_for_pull_status(status: str) -> InstallPhase:
+    normalized = status.strip().lower()
+    if normalized.startswith("verifying"):
+        return InstallPhase.VERIFYING
+    if normalized.startswith("writing manifest") or normalized.startswith("removing any unused layers"):
+        return InstallPhase.INSTALLING
+    return InstallPhase.DOWNLOADING
+
+
 async def _log_install_update(
     context: RunnerContext,
     phase: InstallPhase,
@@ -350,6 +388,7 @@ class OllamaRunner(ModelRunner):
 
         connected = False
         seen_success = False
+        progress_tracker = _PullProgressTracker()
         await _log_install_update(context, InstallPhase.CONNECTING, InstallPhaseState.ACTIVE)
 
         try:
@@ -371,19 +410,21 @@ class OllamaRunner(ModelRunner):
                     await _log_install_update(context, InstallPhase.CONNECTING, InstallPhaseState.DONE)
                     connected = True
 
-                progress = _pull_progress(update)
+                if status.lower() == "success":
+                    seen_success = True
+                    continue
+
+                phase = _phase_for_pull_status(status)
+                progress = progress_tracker.progress(update) if phase is InstallPhase.DOWNLOADING else None
                 await _log_install_update(
                     context,
-                    InstallPhase.DOWNLOADING,
+                    phase,
                     InstallPhaseState.ACTIVE,
                     detail=status,
                     progress=progress,
                 )
-                if progress is not None:
+                if phase is InstallPhase.DOWNLOADING and progress is not None:
                     await context.progress(progress)
-
-                if status.lower() == "success":
-                    seen_success = True
 
             if not connected:
                 return Err(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -13,7 +14,14 @@ from runic import DefaultError, Err, Ok, Result, Runic
 
 from .controller import ModelController
 from .embed_picker import EmbedPickerProgress, EmbedPickerState, expand_selected_paths
-from .install_status import InstallPhase, InstallStatusUpdate, format_install_line, parse_install_status
+from .install_status import (
+    InstallPhase,
+    InstallPhaseState,
+    InstallStatusUpdate,
+    format_install_line,
+    parse_install_status,
+    spinner_frame,
+)
 from .models import ChatMessage
 from .registry import ModelRegistry, default_registry_path
 from .runners.base import RunnerChatError
@@ -334,7 +342,14 @@ def format_install_pane(model: str, progress: float, lines: Sequence[str]) -> st
     return "\n".join(rendered)
 
 
-def _set_install_phase_pane(state: TuiShellState, model: str, message: str, progress: float) -> None:
+def _set_install_phase_pane(
+    state: TuiShellState,
+    model: str,
+    message: str,
+    progress: float,
+    *,
+    spinner: str | None = None,
+) -> None:
     update = parse_install_status(message)
     if update is None:
         state.set_pane(
@@ -353,7 +368,7 @@ def _set_install_phase_pane(state: TuiShellState, model: str, message: str, prog
             detail=update.detail,
             progress=progress,
         )
-    lines: list[str] = [model, format_install_line(update, width=14)]
+    lines: list[str] = [model, format_install_line(update, width=14, spinner=spinner)]
     if update.detail:
         lines.append(update.detail)
     state.set_pane(
@@ -374,23 +389,90 @@ async def _track_install_until_settled(
 ) -> Result[object, DefaultError]:
     wait_task = asyncio.create_task(controller.wait_for_install(spell_id))
     log_events = controller.install_log_events()
+    event_task: asyncio.Task[object] | None = None
+    current_message: str | None = None
+    current_progress = 0.0
+    spinner_step = 0
     try:
+        record = controller.get_install_record(spell_id)
+        if isinstance(record, Ok):
+            current_progress = record.value.progress
+            replayed_message: str | None = None
+            for message in record.value.logs:
+                if parse_install_status(message) is None:
+                    continue
+                replayed_message = message
+                current_message = message
+                _set_install_phase_pane(
+                    state,
+                    model,
+                    message,
+                    current_progress,
+                    spinner=spinner_frame(spinner_step),
+                )
+            if replayed_message is not None:
+                refresh()
+
         while not wait_task.done():
+            if event_task is None:
+                event_task = asyncio.create_task(anext(log_events))
             try:
-                event = await asyncio.wait_for(anext(log_events), timeout=0.05)
-            except StopAsyncIteration:
+                done, _ = await asyncio.wait({wait_task, event_task}, timeout=0.05, return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError:
+                raise
+
+            if wait_task in done:
                 break
-            except asyncio.TimeoutError:
+
+            if event_task not in done:
+                if current_message is not None:
+                    update = parse_install_status(current_message)
+                    if update is not None and update.state is InstallPhaseState.ACTIVE:
+                        spinner_step += 1
+                        _set_install_phase_pane(
+                            state,
+                            model,
+                            current_message,
+                            current_progress,
+                            spinner=spinner_frame(spinner_step),
+                        )
+                        refresh()
                 continue
+
+            try:
+                event = event_task.result()
+            except StopAsyncIteration:
+                event_task = None
+                continue
+            finally:
+                if event_task is not None and event_task.done():
+                    event_task = None
+
             if event.data.spell_id != spell_id:
                 continue
+            if parse_install_status(event.data.message) is None:
+                continue
             record = controller.get_install_record(spell_id)
-            progress = 0.0
             if isinstance(record, Ok):
-                progress = record.value.progress
-            _set_install_phase_pane(state, model, event.data.message, progress)
+                current_progress = record.value.progress
+            current_message = event.data.message
+            _set_install_phase_pane(
+                state,
+                model,
+                event.data.message,
+                current_progress,
+                spinner=spinner_frame(spinner_step),
+            )
             refresh()
     finally:
+        if event_task is not None:
+            if not event_task.done():
+                event_task.cancel()
+                with suppress(asyncio.CancelledError, StopAsyncIteration):
+                    await event_task
+            else:
+                with suppress(asyncio.CancelledError, StopAsyncIteration):
+                    event_task.result()
         await log_events.aclose()
 
     result = await wait_task

@@ -176,6 +176,84 @@ class StreamingInstallController(FakeController):
         return Ok({"spell_id": spell_id})
 
 
+class ReplayOnlyInstallController(FakeController):
+    def __init__(self) -> None:
+        super().__init__(install_result=Ok("spell-123"))
+        self.record = SimpleNamespace(
+            progress=0.5,
+            logs=[
+                encode_install_status(
+                    InstallStatusUpdate(
+                        phase=InstallPhase.CONNECTING,
+                        state=InstallPhaseState.DONE,
+                    )
+                ),
+                encode_install_status(
+                    InstallStatusUpdate(
+                        phase=InstallPhase.DOWNLOADING,
+                        state=InstallPhaseState.ACTIVE,
+                        progress=0.5,
+                    )
+                ),
+            ],
+        )
+
+    def get_install_record(self, spell_id: str) -> object:
+        return Ok(self.record)
+
+    async def install_log_events(self):
+        if False:
+            yield None
+
+    async def wait_for_install(self, spell_id: str) -> object:
+        await asyncio.sleep(0.02)
+        return Ok({"spell_id": spell_id})
+
+
+class RawOnlyInstallController(FakeController):
+    def get_install_record(self, spell_id: str) -> object:
+        return Ok(SimpleNamespace(progress=0.0, logs=["pulling manifest"]))
+
+    async def install_log_events(self):
+        await asyncio.sleep(0)
+        yield SimpleNamespace(data=SimpleNamespace(spell_id="spell-123", message="pulling sha256:a"))
+
+    async def wait_for_install(self, spell_id: str) -> object:
+        await asyncio.sleep(0.02)
+        return Ok({"spell_id": spell_id})
+
+
+class AnimatedInstallController(FakeController):
+    def __init__(self) -> None:
+        super().__init__(install_result=Ok("spell-123"))
+        self.progress = 0.5
+
+    def get_install_record(self, spell_id: str) -> object:
+        return Ok(
+            SimpleNamespace(
+                progress=self.progress,
+                logs=[
+                    encode_install_status(
+                        InstallStatusUpdate(
+                            phase=InstallPhase.DOWNLOADING,
+                            state=InstallPhaseState.ACTIVE,
+                            progress=self.progress,
+                        )
+                    )
+                ],
+            )
+        )
+
+    async def install_log_events(self):
+        await asyncio.sleep(1.0)
+        if False:
+            yield None
+
+    async def wait_for_install(self, spell_id: str) -> object:
+        await asyncio.sleep(0.12)
+        return Ok({"spell_id": spell_id})
+
+
 class CompletingRunner:
     name = "ollama"
     capabilities = (RunnerCapability(provider=ModelProvider.OLLAMA, can_embed=True),)
@@ -212,6 +290,49 @@ class CompletingRunner:
 
     async def embed(self, model: str, text: str):  # type: ignore[no-untyped-def]
         return Ok([float(len(model)), float(len(text))])
+
+
+class DelayedStructuredRunner(CompletingRunner):
+    async def install_model(self, reference, context):  # type: ignore[no-untyped-def]
+        await context.log(
+            encode_install_status(
+                InstallStatusUpdate(
+                    phase=InstallPhase.DOWNLOADING,
+                    state=InstallPhaseState.ACTIVE,
+                    progress=0.5,
+                )
+            )
+        )
+        await context.progress(0.5)
+        await asyncio.sleep(0.12)
+        await context.log(
+            encode_install_status(
+                InstallStatusUpdate(
+                    phase=InstallPhase.VERIFYING,
+                    state=InstallPhaseState.ACTIVE,
+                )
+            )
+        )
+        await context.log(
+            encode_install_status(
+                InstallStatusUpdate(
+                    phase=InstallPhase.VERIFYING,
+                    state=InstallPhaseState.DONE,
+                )
+            )
+        )
+        await asyncio.sleep(0.06)
+        await context.progress(1.0)
+        self.installed.append(reference.model)
+        return Ok(
+            InstalledModel(
+                name=reference.local_name,
+                provider=reference.provider,
+                source=reference.source,
+                runner=self.name,
+                status=ModelInstallStatus.INSTALLED,
+            )
+        )
 
 
 def make_prompt_fn(commands: list[str], chat_prompts: list[str]) -> Callable[[str], str]:
@@ -627,6 +748,95 @@ class TestInteractiveShell(unittest.TestCase):
 
         self.assertEqual(Ok({"spell_id": "spell-123"}), result)
         self.assertIn("installing.... done!", state.pane_text())
+
+    def test_track_install_until_settled_replays_existing_logs_before_subscribing(self) -> None:
+        controller = ReplayOnlyInstallController()
+        state = TuiShellState()
+        snapshots: list[str] = []
+
+        result = asyncio.run(
+            shell._track_install_until_settled(
+                controller,
+                "spell-123",
+                "llama3.2",
+                state,
+                lambda: snapshots.append(state.pane_text()),
+            )
+        )
+
+        self.assertEqual(Ok({"spell_id": "spell-123"}), result)
+        self.assertTrue(any("downloading... [#######_______] 50%" in snapshot for snapshot in snapshots))
+        self.assertIn("installing.... done!", state.pane_text())
+
+    def test_track_install_until_settled_ignores_raw_logs_for_pane_updates(self) -> None:
+        controller = RawOnlyInstallController()
+        state = TuiShellState(
+            pane=PaneState(
+                title="Install",
+                lines=("llama3.2", "connecting...."),
+                footer=shell.INSTALL_PANE_FOOTER,
+            )
+        )
+        snapshots: list[str] = []
+
+        result = asyncio.run(
+            shell._track_install_until_settled(
+                controller,
+                "spell-123",
+                "llama3.2",
+                state,
+                lambda: snapshots.append(state.pane_text()),
+            )
+        )
+
+        self.assertEqual(Ok({"spell_id": "spell-123"}), result)
+        self.assertFalse(any("pulling sha256:a" in snapshot for snapshot in snapshots))
+        self.assertIn("installing.... done!", state.pane_text())
+
+    def test_track_install_until_settled_animates_spinner_for_active_phase(self) -> None:
+        controller = AnimatedInstallController()
+        state = TuiShellState()
+        snapshots: list[str] = []
+
+        result = asyncio.run(
+            shell._track_install_until_settled(
+                controller,
+                "spell-123",
+                "llama3.2",
+                state,
+                lambda: snapshots.append(state.pane_text()),
+            )
+        )
+
+        self.assertEqual(Ok({"spell_id": "spell-123"}), result)
+        self.assertTrue(any("⠾ downloading... [#######_______] 50%" in snapshot for snapshot in snapshots))
+        self.assertTrue(any("⠽ downloading... [#######_______] 50%" in snapshot for snapshot in snapshots))
+        self.assertIn("installing.... done!", state.pane_text())
+
+    def test_track_install_until_settled_keeps_real_log_subscription_alive_across_timeouts(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            registry = ModelRegistry(Path(tempdir) / "models.json")
+            controller = ModelController(Runic(), registry, runners=(DelayedStructuredRunner(),))
+            state = TuiShellState()
+            snapshots: list[str] = []
+
+            async def run_case() -> object:
+                scheduled = await controller.install("llama3.2")
+                self.assertIsInstance(scheduled, Ok)
+                assert isinstance(scheduled, Ok)
+                return await shell._track_install_until_settled(
+                    controller,
+                    scheduled.value,
+                    "llama3.2",
+                    state,
+                    lambda: snapshots.append(state.pane_text()),
+                )
+            result = asyncio.run(run_case())
+
+            self.assertEqual(ModelInstallStatus.INSTALLED, registry.get("llama3.2").status)
+            self.assertIsInstance(result, Ok)
+            self.assertTrue(any("⠽ downloading... [#######_______] 50%" in snapshot for snapshot in snapshots))
+            self.assertTrue(any("verifying.... verified!" in snapshot for snapshot in snapshots))
 
     def test_help_lists_chat_and_embed_commands(self) -> None:
         controller = FakeController()

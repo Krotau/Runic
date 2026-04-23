@@ -10,6 +10,7 @@ from runic.interactive.install_status import (
     format_install_line,
     is_install_status_log,
     parse_install_status,
+    spinner_frame,
 )
 
 
@@ -46,3 +47,20 @@ class TestInteractiveInstallStatus(unittest.TestCase):
         )
 
         self.assertEqual("downloading... [#######_______] 50%", format_install_line(update, width=14))
+
+    def test_format_install_line_prefixes_spinner_for_active_phase(self) -> None:
+        update = InstallStatusUpdate(
+            phase=InstallPhase.DOWNLOADING,
+            state=InstallPhaseState.ACTIVE,
+            progress=0.5,
+        )
+
+        self.assertEqual("⠾ downloading... [#######_______] 50%", format_install_line(update, width=14, spinner="⠾"))
+
+    def test_spinner_frame_cycles_braille_pattern_sequence(self) -> None:
+        self.assertEqual("⠾", spinner_frame(0))
+        self.assertEqual("⠽", spinner_frame(1))
+        self.assertEqual("⠻", spinner_frame(2))
+        self.assertEqual("⠯", spinner_frame(3))
+        self.assertEqual("⠷", spinner_frame(4))
+        self.assertEqual("⠾", spinner_frame(5))
