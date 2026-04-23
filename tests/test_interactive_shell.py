@@ -9,9 +9,11 @@ import tempfile
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from runic import DefaultError, Err, Ok, Runic
+from runic.interactive.install_status import InstallPhase, InstallPhaseState, InstallStatusUpdate, encode_install_status
 from runic.interactive.controller import ModelController
 from runic.interactive.models import ChatMessage, InstalledModel, ModelInstallStatus, ModelProvider
 from runic.interactive.registry import ModelRegistry
@@ -83,6 +85,13 @@ class FakeController:
     async def wait_for_install(self, spell_id: str) -> object:
         return Ok({"spell_id": spell_id})
 
+    def get_install_record(self, spell_id: str) -> object:
+        return Ok(SimpleNamespace(progress=1.0, logs=[]))
+
+    async def install_log_events(self):
+        if False:
+            yield None
+
     async def chat(self, model: str, messages: tuple[ChatMessage, ...]):
         self.chat_calls.append((model, messages))
         for chunk in self.chat_chunks:
@@ -116,6 +125,55 @@ class PartiallyFailingEmbedController(FakeController):
         if text == "fail":
             return Err(DefaultError(message="Failed to embed with Ollama.", code="runner_embed_failed"))
         return Ok([1.0, 2.0, float(len(text))])
+
+
+class StreamingInstallController(FakeController):
+    def __init__(self) -> None:
+        super().__init__(install_result=Ok("spell-123"))
+        self.progress = 0.0
+
+    def get_install_record(self, spell_id: str) -> object:
+        return Ok(SimpleNamespace(progress=self.progress, logs=[]))
+
+    async def install_log_events(self):
+        updates = [
+            (
+                encode_install_status(
+                    InstallStatusUpdate(
+                        phase=InstallPhase.CONNECTING,
+                        state=InstallPhaseState.DONE,
+                    )
+                ),
+                0.0,
+            ),
+            (
+                encode_install_status(
+                    InstallStatusUpdate(
+                        phase=InstallPhase.DOWNLOADING,
+                        state=InstallPhaseState.ACTIVE,
+                        progress=0.5,
+                    )
+                ),
+                0.5,
+            ),
+            (
+                encode_install_status(
+                    InstallStatusUpdate(
+                        phase=InstallPhase.VERIFYING,
+                        state=InstallPhaseState.DONE,
+                    )
+                ),
+                1.0,
+            ),
+        ]
+        for message, progress in updates:
+            self.progress = progress
+            await asyncio.sleep(0)
+            yield SimpleNamespace(data=SimpleNamespace(spell_id="spell-123", message=message))
+
+    async def wait_for_install(self, spell_id: str) -> object:
+        await asyncio.sleep(0.02)
+        return Ok({"spell_id": spell_id})
 
 
 class CompletingRunner:
@@ -289,6 +347,23 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertIn("llama3.2", pane)
         self.assertIn("82%", pane)
         self.assertTrue(all(ord(character) < 128 for character in pane))
+
+    def test_set_install_phase_pane_renders_structured_download_status(self) -> None:
+        state = TuiShellState()
+        shell._set_install_phase_pane(
+            state,
+            "llama3.2",
+            encode_install_status(
+                InstallStatusUpdate(
+                    phase=InstallPhase.DOWNLOADING,
+                    state=InstallPhaseState.ACTIVE,
+                    progress=0.5,
+                )
+            ),
+            0.5,
+        )
+
+        self.assertIn("downloading... [#######_______] 50%", state.pane_text())
 
     def test_render_startup_splash_contains_large_special_character_runic_banner(self) -> None:
         splash = shell.render_startup_splash()
@@ -527,6 +602,31 @@ class TestInteractiveShell(unittest.TestCase):
             self.assertEqual(["llama3.2"], runner.installed)
             self.assertEqual(ModelInstallStatus.INSTALLED, registry.get("llama3.2").status)
             self.assertIn("Installation completed", console.text())
+
+    def test_install_command_redraws_prompt_shell_with_live_updates(self) -> None:
+        controller = StreamingInstallController()
+        console = FakeConsole()
+        console.width = 120
+
+        result = shell.run_interactive(
+            controller=controller,
+            prompt_fn=make_prompt_fn(["install llama3.2", "exit"], []),
+            console=console,
+        )
+
+        self.assertEqual(0, result)
+        self.assertIn("connecting.... connected!", console.text())
+        self.assertIn("downloading... [#######_______] 50%", console.text())
+        self.assertIn("verifying.... verified!", console.text())
+
+    def test_track_install_until_settled_updates_tui_pane_from_streamed_logs(self) -> None:
+        controller = StreamingInstallController()
+        state = TuiShellState()
+
+        result = asyncio.run(shell._track_install_until_settled(controller, "spell-123", "llama3.2", state, lambda: None))
+
+        self.assertEqual(Ok({"spell_id": "spell-123"}), result)
+        self.assertIn("installing.... done!", state.pane_text())
 
     def test_help_lists_chat_and_embed_commands(self) -> None:
         controller = FakeController()

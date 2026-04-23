@@ -4,8 +4,9 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
-from runic import DefaultError, Err, Ok, Result, Runic, SpellContext
+from runic import DefaultError, Err, Ok, Result, Runic, SpellContext, SpellRecord
 
+from .install_status import is_install_status_log
 from .models import ChatMessage, InstalledModel, ModelInstallStatus, ModelProvider, ModelReference
 from .parsing import parse_model_reference
 from .registry import ModelRegistry
@@ -111,6 +112,12 @@ class ModelController:
 
     async def wait_for_install(self, spell_id: str) -> Result[object, DefaultError]:
         return await self._runtime.conduit.wait(spell_id)
+
+    def get_install_record(self, spell_id: str) -> Result[SpellRecord, DefaultError]:
+        return self._runtime.conduit.get_status(spell_id)
+
+    def install_log_events(self):
+        return self._runtime.conduit.log_events()
 
     def list_installed(self) -> tuple[InstalledModel, ...]:
         return tuple(
@@ -259,7 +266,10 @@ class ModelController:
         # for later inspection.
         if not ctx.record.logs:
             return None
-        return ctx.record.logs[-1]
+        for message in reversed(ctx.record.logs):
+            if not is_install_status_log(message):
+                return message
+        return None
 
     def _unsupported_message(self, provider: ModelProvider) -> str:
         match provider:
