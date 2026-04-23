@@ -65,6 +65,7 @@ class PaneState:
     title: str
     lines: Sequence[str] = ()
     footer: Sequence[str] = ()
+    layout: str = "side"
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +180,13 @@ def _row(text: object, width: int) -> str:
     return "|" + _fit(text, max(0, width - 2)) + "|"
 
 
+def _pane_lines(pane: PaneState) -> list[str]:
+    lines = [pane.title, *pane.lines]
+    if pane.footer:
+        lines.extend(["", *pane.footer])
+    return [str(line) for line in lines]
+
+
 def render_shell_frame(frame: ShellFrame) -> str:
     width = max(40, frame.width)
     height = max(7, frame.height)
@@ -187,7 +195,7 @@ def render_shell_frame(frame: ShellFrame) -> str:
 
     if pane is not None and width < MIN_SIDE_PANE_WIDTH:
         rows: list[str] = [_border(width)]
-        pane_lines = [pane.title, *pane.lines, *pane.footer]
+        pane_lines = _pane_lines(pane)
         pane_height = min(max(1, len(pane_lines)), max(1, height - 6))
         for line in pane_lines[:pane_height]:
             rows.append(_row(line, width))
@@ -216,11 +224,33 @@ def render_shell_frame(frame: ShellFrame) -> str:
         rows.append(_border(width))
         return "\n".join(rows[:height])
 
+    if pane.layout == "wide":
+        pane_lines = _pane_lines(pane)
+        pane_height = min(max(4, len(pane_lines) + 2), max(4, height // 2) + 2)
+        max_pane_lines = max(1, pane_height - 2)
+        if len(pane_lines) > max_pane_lines and max_pane_lines > 1:
+            pane_lines = [pane_lines[0], *pane_lines[-(max_pane_lines - 1):]]
+        else:
+            pane_lines = pane_lines[:max_pane_lines]
+        rows.append(_border(width))
+        for line in pane_lines:
+            rows.append(_row(line, width))
+        while len(rows) < pane_height:
+            rows.append(_row("", width))
+        rows.append(_border(width))
+        body_height = max(1, height - len(rows) - 2)
+        for line in output[-body_height:]:
+            rows.append(_row(line, width))
+        while len(rows) < height - 2:
+            rows.append(_row("", width))
+        rows.append(_border(width))
+        rows.append(_row(frame.prompt, width))
+        rows.append(_border(width))
+        return "\n".join(rows[:height])
+
     pane_width = min(28, max(22, width // 3))
     left_width = width - pane_width - 1
-    pane_lines = [pane.title, *pane.lines]
-    if pane.footer:
-        pane_lines.extend(["", *pane.footer])
+    pane_lines = _pane_lines(pane)
     body_height = max(1, height - 5)
     rows.append("+" + "-" * max(0, left_width - 2) + "+" + "-" * max(0, pane_width - 2) + "+")
     visible_output = output[-body_height:]

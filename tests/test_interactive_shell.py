@@ -330,6 +330,51 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertIn("runic> install", frame)
         self.assertTrue(all(ord(character) < 128 for character in frame))
 
+    def test_render_shell_frame_draws_wide_embed_picker_pane_above_output(self) -> None:
+        frame = render_shell_frame(
+            ShellFrame(
+                title="Runic Interactive",
+                status="runner: ollama ready",
+                output=("Runic interactive shell", "previous output"),
+                prompt="runic> _",
+                pane=PaneState(
+                    title="Embed Files: qwen3-embedding:8b",
+                    lines=(
+                        "Pick files to parse. Space multi-select, Tab enters dirs, Enter embeds selected.",
+                        "cwd /home/arc/Wyvern",
+                        "> [ ] [dir] runic directory",
+                        "  [ ] .md README.md 4.0 KB",
+                    ),
+                    footer=("Space select", "Tab enter dir", "Enter embed selected"),
+                    layout="wide",
+                ),
+                width=90,
+                height=16,
+            )
+        )
+
+        lines = frame.splitlines()
+        self.assertIn("Embed Files: qwen3-embedding:8b", frame)
+        self.assertLess(frame.index("Embed Files: qwen3-embedding:8b"), frame.index("Runic interactive shell"))
+        self.assertIn("Enter embed selected", frame)
+        self.assertTrue(all(len(line) == 90 for line in lines))
+
+    def test_render_shell_frame_keeps_default_pane_on_right(self) -> None:
+        frame = render_shell_frame(
+            ShellFrame(
+                title="Runic Interactive",
+                status="runner: ollama ready",
+                output=("Resolving model reference...",),
+                prompt="runic> _",
+                pane=PaneState(title="Install", lines=("llama3.2",), layout="side"),
+                width=78,
+                height=12,
+            )
+        )
+
+        self.assertIn("|Resolving model reference", frame)
+        self.assertIn("|Install", frame)
+
     def test_render_shell_frame_collapses_pane_on_small_width(self) -> None:
         frame = render_shell_frame(
             ShellFrame(
