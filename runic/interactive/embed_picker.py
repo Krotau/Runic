@@ -91,7 +91,7 @@ def list_embed_picker_entries(
     except OSError:
         return ()
 
-    sorted_children = sorted(children, key=lambda path: (not path.is_dir(), path.name))
+    sorted_children = sorted(children, key=lambda path: (not path.is_dir(), path.name.lower(), path.name))
     entries: list[EmbedPickerEntry] = []
     for index, path in enumerate(sorted_children):
         resolved = path.resolve()
