@@ -673,6 +673,20 @@ class TestInteractiveShell(unittest.TestCase):
         self.assertIn("runner_embed_failed: Failed to embed with Ollama.", output)
         self.assertIn("Embedding completed: 1 succeeded, 1 failed, 0 skipped", output)
 
+    def test_non_tui_embed_model_without_value_keeps_usage_error(self) -> None:
+        controller = FakeController()
+        console = FakeConsole()
+
+        result = shell.run_interactive(
+            controller=controller,
+            prompt_fn=make_prompt_fn(["embed qwen3-embedding:8b", "exit"], []),
+            console=console,
+        )
+
+        self.assertEqual(0, result)
+        self.assertEqual([], controller.embed_calls)
+        self.assertIn("invalid_command: Use embed <model> <text-or-file-path>.", console.text())
+
     def test_missing_optional_cli_extras_prints_hint_and_returns_one(self) -> None:
         controller = FakeController()
         output = io.StringIO()
