@@ -110,6 +110,14 @@ class FailingChatController(FakeController):
             yield ""
 
 
+class PartiallyFailingEmbedController(FakeController):
+    async def embed(self, model: str, text: str) -> object:
+        self.embed_calls.append((model, text))
+        if text == "fail":
+            return Err(DefaultError(message="Failed to embed with Ollama.", code="runner_embed_failed"))
+        return Ok([1.0, 2.0, float(len(text))])
+
+
 class CompletingRunner:
     name = "ollama"
     capabilities = (RunnerCapability(provider=ModelProvider.OLLAMA, can_embed=True),)
@@ -642,6 +650,28 @@ class TestInteractiveShell(unittest.TestCase):
 
         self.assertEqual(0, result)
         self.assertEqual([("qwen3-embedding:8b", "file text")], controller.embed_calls)
+
+    def test_embed_picker_batch_embeds_each_file_and_continues_after_failure(self) -> None:
+        controller = PartiallyFailingEmbedController()
+        state = TuiShellState()
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            good = root / "good.txt"
+            bad = root / "bad.txt"
+            good.write_text("good", encoding="utf-8")
+            bad.write_text("fail", encoding="utf-8")
+            state.open_embed_picker("qwen3-embedding:8b")
+            state.embed_picker.selected_paths = {good.resolve(), bad.resolve()}
+
+            asyncio.run(shell._embed_picker_selection(controller, state))
+
+        self.assertEqual([("qwen3-embedding:8b", "fail"), ("qwen3-embedding:8b", "good")], sorted(controller.embed_calls))
+        output = "\n".join(state.output)
+        self.assertIn("good.txt", output)
+        self.assertIn("Embedding dimensions: 3", output)
+        self.assertIn("bad.txt", output)
+        self.assertIn("runner_embed_failed: Failed to embed with Ollama.", output)
+        self.assertIn("Embedding completed: 1 succeeded, 1 failed, 0 skipped", output)
 
     def test_missing_optional_cli_extras_prints_hint_and_returns_one(self) -> None:
         controller = FakeController()

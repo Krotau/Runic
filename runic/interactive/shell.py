@@ -12,7 +12,7 @@ from typing import Protocol
 from runic import DefaultError, Err, Ok, Result, Runic
 
 from .controller import ModelController
-from .embed_picker import EmbedPickerState
+from .embed_picker import EmbedPickerProgress, EmbedPickerState, expand_selected_paths
 from .models import ChatMessage
 from .registry import ModelRegistry, default_registry_path
 from .runners.base import RunnerChatError
@@ -785,6 +785,16 @@ def _run_tui_application(controller: ModelController) -> int:
             state.refresh_embed_picker_pane()
             refresh()
 
+    @key_bindings.add("enter", filter=pane_focused & picker_active)
+    def _(event):  # type: ignore[no-untyped-def]
+        async def embed_selected() -> None:
+            await _embed_picker_selection(controller, state)
+            refresh()
+            if state.embed_picker is not None and state.embed_picker.progress is not None:
+                event.app.layout.focus(command_area)
+
+        event.app.create_background_task(embed_selected())
+
     @key_bindings.add("escape", filter=pane_focused & picker_active)
     def _(event):  # type: ignore[no-untyped-def]
         state.close_embed_picker()
@@ -1008,6 +1018,53 @@ async def _embed_and_print(controller: ModelController, model: str, text: str, c
             console.print(f"Embedding preview: {_format_embedding_preview(embedding)}")
         case Err(error=error):
             console.print(_format_error(error))
+
+
+async def _embed_picker_selection(controller: ModelController, state: TuiShellState) -> None:
+    picker = state.embed_picker
+    if picker is None:
+        return
+    if not picker.selected_paths:
+        picker.message = "Select at least one file or directory."
+        state.refresh_embed_picker_pane()
+        return
+
+    expansion = expand_selected_paths(sorted(picker.selected_paths, key=lambda path: str(path)))
+    if not expansion.files:
+        state.append("No readable files selected for embedding.")
+        picker.message = "No readable files found."
+        state.refresh_embed_picker_pane()
+        return
+
+    picker.progress = EmbedPickerProgress(total=len(expansion.files), skipped=expansion.skipped)
+    picker.message = ""
+    state.refresh_embed_picker_pane()
+
+    succeeded = 0
+    failed = 0
+    for readable_file in expansion.files:
+        state.append(f"Embedding file: {readable_file.path}")
+        result = await controller.embed(picker.model, readable_file.text)
+        match result:
+            case Ok(value=embedding):
+                succeeded += 1
+                state.append(f"{readable_file.path}: Embedding dimensions: {len(embedding)}")
+                state.append(f"{readable_file.path}: Embedding preview: {_format_embedding_preview(embedding)}")
+            case Err(error=error):
+                failed += 1
+                state.append(f"{readable_file.path}: {_format_error(error)}")
+        picker.progress = EmbedPickerProgress(
+            total=len(expansion.files),
+            processed=succeeded + failed,
+            succeeded=succeeded,
+            failed=failed,
+            skipped=expansion.skipped,
+        )
+        state.refresh_embed_picker_pane()
+
+    picker.message = f"Embedding completed: {succeeded} succeeded, {failed} failed, {expansion.skipped} skipped"
+    state.append(picker.message)
+    state.refresh_embed_picker_pane()
 
 
 def _print_install_result(result: Result[str, DefaultError], console: _Console) -> None:
