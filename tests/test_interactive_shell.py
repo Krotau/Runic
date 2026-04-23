@@ -434,6 +434,34 @@ class TestInteractiveShell(unittest.TestCase):
         state.cycle_pane_position()
         self.assertEqual("top", state.pane_position)
 
+    def test_tui_shell_state_opens_embed_picker_at_launch_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir)
+            (root / "README.md").write_text("hello", encoding="utf-8")
+            state = TuiShellState(launch_cwd=root)
+
+            state.open_embed_picker("qwen3-embedding:8b")
+
+        self.assertIsNotNone(state.embed_picker)
+        self.assertEqual(root.resolve(), state.embed_picker.current_dir)
+        self.assertEqual("Embed Files: qwen3-embedding:8b", state.pane.title)
+        self.assertEqual("wide", state.pane.layout)
+        self.assertTrue(state.pane_visible)
+        self.assertIn("README.md", state.pane_text())
+
+    def test_tui_shell_state_footer_switches_to_picker_shortcuts(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            state = TuiShellState(launch_cwd=Path(tempdir))
+            state.open_embed_picker("qwen3-embedding:8b")
+
+            footer = state.footer_text()
+
+        self.assertIn("Space select", footer)
+        self.assertIn("Tab enter dir", footer)
+        self.assertIn("Enter embed", footer)
+        self.assertIn("Backspace up", footer)
+        self.assertIn("Esc cancel", footer)
+
     def test_tui_shell_state_footer_lists_shortcuts(self) -> None:
         state = TuiShellState()
 

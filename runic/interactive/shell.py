@@ -12,6 +12,7 @@ from typing import Protocol
 from runic import DefaultError, Err, Ok, Result, Runic
 
 from .controller import ModelController
+from .embed_picker import EmbedPickerState
 from .models import ChatMessage
 from .registry import ModelRegistry, default_registry_path
 from .runners.base import RunnerChatError
@@ -88,6 +89,8 @@ class TuiShellState:
     pane_position: str = "right"
     pane_visible: bool = False
     chat_model: str | None = None
+    launch_cwd: Path = field(default_factory=Path.cwd)
+    embed_picker: EmbedPickerState | None = None
 
     def append(self, line: str) -> None:
         self.output.append(line)
@@ -98,6 +101,7 @@ class TuiShellState:
 
     def hide_pane(self) -> None:
         self.pane_visible = False
+        self.embed_picker = None
 
     def cycle_pane_position(self) -> None:
         match self.pane_position:
@@ -132,6 +136,33 @@ class TuiShellState:
         self.status = "runner: ollama ready"
         self.prompt = "runic> "
 
+    def open_embed_picker(self, model: str) -> None:
+        self.embed_picker = EmbedPickerState.start(self.launch_cwd, model=model)
+        self.set_pane(
+            PaneState(
+                title=f"Embed Files: {model}",
+                lines=self.embed_picker.format_lines(),
+                footer=("Space select", "Tab enter dir", "Enter embed selected", "Backspace up", "Esc cancel"),
+                layout="wide",
+            )
+        )
+
+    def close_embed_picker(self) -> None:
+        self.embed_picker = None
+        self.hide_pane()
+
+    def refresh_embed_picker_pane(self) -> None:
+        if self.embed_picker is None:
+            return
+        self.set_pane(
+            PaneState(
+                title=f"Embed Files: {self.embed_picker.model}",
+                lines=self.embed_picker.format_lines(),
+                footer=("Space select", "Tab enter dir", "Enter embed selected", "Backspace up", "Esc cancel"),
+                layout="wide",
+            )
+        )
+
     def output_text(self) -> str:
         return "\n".join(self.output)
 
@@ -150,6 +181,8 @@ class TuiShellState:
         return self.prompt
 
     def footer_text(self) -> str:
+        if self.embed_picker is not None:
+            return "Up/Down move | Space select | Tab enter dir | Enter embed | Backspace up | Esc cancel | Ctrl-Q quit"
         return "Tab accept/next | Enter run/select | Shift-Tab previous | F6 focus | Esc hide pane | Ctrl-P move pane | Ctrl-Q quit"
 
 
@@ -495,7 +528,7 @@ def _run_tui_application(controller: ModelController) -> int:
         print(_cli_extras_message())
         return 1
 
-    state = TuiShellState()
+    state = TuiShellState(launch_cwd=Path.cwd())
     output_area = TextArea(
         text=state.output_text(),
         read_only=True,
@@ -631,10 +664,16 @@ def _run_tui_application(controller: ModelController) -> int:
                     state.enter_chat(command.argument)
                 refresh()
             case ShellCommand.EMBED:
-                split = _split_model_and_value(command.argument, "embed")
+                split = _split_embed_argument(command.argument)
                 match split:
                     case Err(error=error):
                         state.append(_format_error(error))
+                    case Ok(value=(model, None)):
+                        state.append(f"> embed {model}")
+                        state.open_embed_picker(model)
+                        refresh()
+                        get_app().layout.focus(pane_area)
+                        return
                     case Ok(value=(model, value)):
                         embed_input = _read_embed_input(value)
                         match embed_input:
@@ -693,6 +732,14 @@ def _run_tui_application(controller: ModelController) -> int:
     def pane_top() -> bool:
         return state.pane_position == "top"
 
+    @Condition
+    def picker_active() -> bool:
+        return state.embed_picker is not None
+
+    @Condition
+    def pane_wide() -> bool:
+        return state.pane is not None and state.pane.layout == "wide"
+
     @key_bindings.add("enter", filter=completion_menu_visible & input_focused)
     def _(event):  # type: ignore[no-untyped-def]
         completion = command_area.buffer.complete_state.current_completion
@@ -703,7 +750,48 @@ def _run_tui_application(controller: ModelController) -> int:
     def _(event):  # type: ignore[no-untyped-def]
         event.app.create_background_task(accept_input())
 
-    @key_bindings.add("enter", filter=pane_focused)
+    @key_bindings.add("up", filter=pane_focused & picker_active)
+    def _(event):  # type: ignore[no-untyped-def]
+        if state.embed_picker is not None:
+            state.embed_picker.move_up()
+            state.refresh_embed_picker_pane()
+            refresh()
+
+    @key_bindings.add("down", filter=pane_focused & picker_active)
+    def _(event):  # type: ignore[no-untyped-def]
+        if state.embed_picker is not None:
+            state.embed_picker.move_down()
+            state.refresh_embed_picker_pane()
+            refresh()
+
+    @key_bindings.add(" ", filter=pane_focused & picker_active)
+    def _(event):  # type: ignore[no-untyped-def]
+        if state.embed_picker is not None:
+            state.embed_picker.toggle_selection()
+            state.refresh_embed_picker_pane()
+            refresh()
+
+    @key_bindings.add("tab", filter=pane_focused & picker_active)
+    def _(event):  # type: ignore[no-untyped-def]
+        if state.embed_picker is not None:
+            state.embed_picker.enter_hovered_directory()
+            state.refresh_embed_picker_pane()
+            refresh()
+
+    @key_bindings.add("backspace", filter=pane_focused & picker_active)
+    def _(event):  # type: ignore[no-untyped-def]
+        if state.embed_picker is not None:
+            state.embed_picker.move_to_parent()
+            state.refresh_embed_picker_pane()
+            refresh()
+
+    @key_bindings.add("escape", filter=pane_focused & picker_active)
+    def _(event):  # type: ignore[no-untyped-def]
+        state.close_embed_picker()
+        refresh()
+        event.app.layout.focus(command_area)
+
+    @key_bindings.add("enter", filter=pane_focused & ~picker_active)
     def _(event):  # type: ignore[no-untyped-def]
         if state.pane is not None:
             state.append(f"Pane details: {state.pane.title}")
@@ -752,7 +840,7 @@ def _run_tui_application(controller: ModelController) -> int:
                 break
         event.app.layout.focus(focus_order[(current_index - 1) % len(focus_order)])
 
-    @key_bindings.add("escape", filter=pane_visible)
+    @key_bindings.add("escape", filter=pane_visible & ~picker_active)
     def _(event):  # type: ignore[no-untyped-def]
         state.hide_pane()
         refresh()
@@ -784,12 +872,18 @@ def _run_tui_application(controller: ModelController) -> int:
     right_body = VSplit(
         [
             Frame(output_area, title="Output"),
-            ConditionalContainer(Frame(pane_area, title="Pane"), filter=pane_visible & pane_right),
+            ConditionalContainer(Frame(pane_area, title="Pane"), filter=pane_visible & pane_right & ~pane_wide),
         ]
     )
     top_body = HSplit(
         [
-            ConditionalContainer(Frame(pane_area, title="Pane"), filter=pane_visible & pane_top),
+            ConditionalContainer(Frame(pane_area, title="Pane"), filter=pane_visible & pane_top & ~pane_wide),
+            Frame(output_area, title="Output"),
+        ]
+    )
+    wide_body = HSplit(
+        [
+            ConditionalContainer(Frame(pane_area, title="Pane"), filter=pane_visible & pane_wide),
             Frame(output_area, title="Output"),
         ]
     )
@@ -797,8 +891,9 @@ def _run_tui_application(controller: ModelController) -> int:
         [
             header,
             command_section,
-            ConditionalContainer(right_body, filter=~pane_top),
-            ConditionalContainer(top_body, filter=pane_top),
+            ConditionalContainer(wide_body, filter=pane_wide),
+            ConditionalContainer(right_body, filter=~pane_top & ~pane_wide),
+            ConditionalContainer(top_body, filter=pane_top & ~pane_wide),
             footer,
         ]
     )
